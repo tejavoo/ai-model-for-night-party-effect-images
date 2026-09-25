@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.DS_Store
+
+# Training outputs
+runs/
+checkpoints/
+outputs/
+previews/
+*.pt
+*.pth
+*.safetensors
+*.mlpackage/
+*.mlmodel
+
+# Local datasets
+data/
+datasets/
+*.zip
+*.tar
+*.tar.gz
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.DS_Store

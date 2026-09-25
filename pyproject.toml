@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nightflash-edge"
+version = "0.1.0"
+description = "Small unpaired image-to-image training and Core ML export toolkit for the Night Flash camera look"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Night Flash Edge contributors"}]
+dependencies = [
+  "torch>=2.2",
+  "numpy>=1.24",
+  "Pillow>=10.0",
+  "tqdm>=4.65",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+tui = ["textual>=0.40"]
+coreml = ["coremltools>=8.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+nightflash-train = "nightflash.train:main"
+nightflash-infer = "nightflash.infer:main"
+nightflash-evaluate = "nightflash.evaluate:main"
+nightflash-tui = "nightflash.tui:main"
+nightflash-export-coreml = "nightflash.export_coreml:main"
+nightflash-validate-coreml = "nightflash.validate_coreml:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
