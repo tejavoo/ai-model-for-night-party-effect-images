@@ -516,6 +516,15 @@ class Session:
                 "loss_version": LOSS_VERSION,
                 "train_mode": self.train_mode,
                 "paired_weight": self.paired_weight,
+                "degrade": self.degrade.to_dict(),
+                "validation": {
+                    k: (str(v) if isinstance(v, Path) else v)
+                    for k, v in self.val_config.items()
+                },
+                "keep_best": self.keep_best,
+                "keep_last": self.keep_last,
+                "ema_decay": self.ema_decay,
+                "augment": self.augment.describe(),
             },
         )
 

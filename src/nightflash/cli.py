@@ -63,6 +63,75 @@ def add_common(parser: argparse.ArgumentParser, *, need_data: bool = True) -> No
         default=0,
         help="publish a Kaggle Dataset version every N epochs; 0 disables",
     )
+
+    # --- training mode and synthetic degradation ---
+    parser.add_argument(
+        "--train-mode",
+        choices=("unpaired", "paired", "sameset"),
+        default=None,
+        help="paired (default for a single pool) builds the source by degrading the "
+             "target pool; sameset draws a *different* image as the source; unpaired "
+             "uses two separate pools. Omit to let the arguments decide.",
+    )
+    parser.add_argument(
+        "--degrade-profile",
+        choices=("subtle", "moderate", "strong"),
+        default="moderate",
+        help="degradation strength preset",
+    )
+    parser.add_argument("--degrade-none-prob", type=float, default=None,
+                        help="probability of passing the target through undegraded "
+                             "(default 0.10; a --degrade-config file may set it)")
+    parser.add_argument("--no-degrade-curriculum", dest="degrade_curriculum",
+                        action="store_false", default=None,
+                        help="do not ramp subtle -> moderate -> strong over training "
+                             "(on by default; a --degrade-config file may set it)")
+    parser.add_argument("--degrade-config", default=None,
+                        help="JSON file with DegradeConfig overrides, applied over the profile")
+    parser.add_argument("--paired-weight", type=float, default=1.0,
+                        help="weight on the supervised reconstruction term")
+
+    # per-stage degradation overrides; unset means "use the profile range"
+    for _flag, _help in (
+        ("exposure", "overall gain"), ("black-lift", "shadow floor"),
+        ("contrast", "tonal compression"), ("saturation", "colour intensity"),
+        ("wb", "white-balance warmth"), ("resize", "downscale factor, kills grain"),
+        ("blur", "softening sigma"), ("noise", "sensor noise sigma"),
+    ):
+        key = _flag.replace("-", "_")
+        parser.add_argument(f"--degrade-{_flag}-min", dest=f"degrade_{key}_min",
+                            type=float, default=None, help=f"{_help}: range minimum")
+        parser.add_argument(f"--degrade-{_flag}-max", dest=f"degrade_{key}_max",
+                            type=float, default=None, help=f"{_help}: range maximum")
+
+    # --- validation strip ---
+    parser.add_argument("--val-every", type=int, default=1,
+                        help="render a validation strip every N epochs; 0 disables")
+    parser.add_argument("--val-count", type=int, default=8,
+                        help="images per validation strip")
+    parser.add_argument("--val-select", choices=("fixed", "random"), default="fixed",
+                        help="fixed keeps the same images every epoch so per-image "
+                             "progress is readable")
+    parser.add_argument("--val-cols", type=int, choices=(2, 3), default=3,
+                        help="cells per image: 2 = source|output, 3 adds target")
+    parser.add_argument("--val-split", type=float, default=0.15,
+                        help="fraction of the pool held out for validation")
+    parser.add_argument("--val-holdout-dir", dest="val_dir", default=None,
+                        help="explicit held-out directory for validation strips, "
+                             "overrides --val-split. Distinct from --val-dir.")
+    parser.add_argument("--val-seed", type=int, default=0,
+                        help="seeds the deterministic validation degradation and effects")
+    parser.add_argument("--val-layout", choices=("rows", "cols"), default="rows",
+                        help="rows puts one image per row so input and output are adjacent")
+
+    # --- checkpoint retention ---
+    parser.add_argument("--no-keep-best", dest="keep_best", action="store_false",
+                        default=True,
+                        help="do not write checkpoints/best.pt on a validation improvement")
+    parser.add_argument("--keep-last", type=int, default=3,
+                        help="retain only the newest N per-epoch checkpoints")
+    parser.add_argument("--ema-decay", type=float, default=0.0,
+                        help="generator weight EMA decay; 0 disables. Reduces flicker.")
     parser.add_argument(
         "--snapshot-dataset",
         default=None,
@@ -71,8 +140,42 @@ def add_common(parser: argparse.ArgumentParser, *, need_data: bool = True) -> No
     if need_data:
         parser.add_argument("--source-dir", default=None)
         parser.add_argument("--target-dir", default=None)
-        parser.add_argument("--val-dir", default=None)
+        parser.add_argument("--val-dir", default=None,
+                            help="legacy: recorded in config.json but not consumed by the "
+                                 "training loop; run nightflash.evaluate explicitly")
         parser.add_argument("--mask-dir", default=None)
+
+
+def _degrade_from_args(args: argparse.Namespace):
+    """Build a DegradeConfig from the profile plus any explicit overrides."""
+
+    from .degrade import make_config
+
+    overrides: dict = {}
+    config_path = getattr(args, "degrade_config", None)
+    if config_path:
+        import json
+        from pathlib import Path
+
+        overrides.update(json.loads(Path(config_path).read_text()))
+    for key in ("exposure", "black_lift", "contrast", "saturation",
+                "wb", "resize", "blur", "noise"):
+        low = getattr(args, f"degrade_{key}_min", None)
+        high = getattr(args, f"degrade_{key}_max", None)
+        if low is not None:
+            overrides[f"{key}_min"] = low
+        if high is not None:
+            overrides[f"{key}_max"] = high
+    # An explicit flag beats the config file; an unspecified flag defers to it.
+    # `default=None` is what makes "not given" distinguishable from "given the
+    # default", so a JSON file's value is not silently overwritten.
+    if args.degrade_none_prob is not None:
+        overrides["none_prob"] = args.degrade_none_prob
+    if args.degrade_curriculum is not None:
+        overrides["curriculum"] = args.degrade_curriculum
+    overrides.setdefault("none_prob", 0.10)
+    overrides.setdefault("curriculum", True)
+    return make_config(args.degrade_profile, **overrides)
 
 
 def make_session(args: argparse.Namespace) -> Session:
@@ -105,6 +208,20 @@ def make_session(args: argparse.Namespace) -> Session:
         augment_preset=args.augment,
         snapshot_every=args.snapshot_every,
         snapshot_dataset=args.snapshot_dataset,
+        train_mode=args.train_mode,
+        degrade=_degrade_from_args(args),
+        paired_weight=args.paired_weight,
+        val_every=args.val_every,
+        val_count=args.val_count,
+        val_select=args.val_select,
+        val_cols=args.val_cols,
+        val_split=args.val_split,
+        val_dir_override=getattr(args, "val_dir", None),
+        val_seed=args.val_seed,
+        val_layout=args.val_layout,
+        keep_best=args.keep_best,
+        keep_last=args.keep_last,
+        ema_decay=args.ema_decay,
         **overrides,
     )
 
