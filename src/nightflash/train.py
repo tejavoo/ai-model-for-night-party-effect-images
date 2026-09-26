@@ -293,7 +293,10 @@ def train(args: argparse.Namespace) -> Path:
                 )
                 fake_logits = discriminator(styled)
                 loss_adv = adversarial_loss(fake_logits, True)
-                loss_content = content_loss(styled, source, mask if use_mask else None)
+                loss_content = content_loss(
+                    styled, source, mask if use_mask else None,
+                    texture_reference=deterministic,
+                )
                 loss_moment = moment_loss(styled, target)
                 if use_mask:
                     target_input = torch.cat([target, torch.zeros_like(mask)], dim=1)

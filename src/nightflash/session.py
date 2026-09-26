@@ -36,19 +36,32 @@ from torch import Tensor, nn
 from .arch import ARCHITECTURES, HEADS, build_generator, new_arch_config, run_generator
 from .augment import AugmentConfig
 from .config import ModelConfig
-from .data import UnpairedImageDataset, make_dataloaders
+from .data import UnpairedImageDataset, make_dataloaders, make_mode_dataloaders
+from .degrade import PROFILES, TRAIN_MODES, DegradeConfig, make_config
 from .effects import apply_stochastic_effects
 from .geometry import prepare, restore
 from .losses import (
+    LOSS_VERSION,
     adversarial_loss,
     content_loss,
     effect_regularization,
     identity_loss,
     moment_loss,
+    paired_reconstruction,
+    psnr,
 )
 from .models import PatchDiscriminator
 from .progress import create_reporter
 from .utils import ensure_dir, resolve_device, save_json, save_preview, seed_everything
+from .validate import (
+    ValidationMetrics,
+    _metric_key,
+    append_history,
+    best_epoch,
+    combine_metrics,
+    evaluate_batch,
+    render_strip,
+)
 
 Mode = Literal["plan", "train", "infer"]
 
@@ -93,6 +106,8 @@ class RunState:
     preview_count: int = 0
     inference_count: int = 0
     issue: str | None = None
+    saved_loss_version: int | None = None
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def status(self) -> str:
@@ -159,12 +174,33 @@ class Session:
         augment_preset: str = "default",
         snapshot_every: int = 0,
         snapshot_dataset: str | None = None,
+        train_mode: str | None = None,
+        degrade: "DegradeConfig | None" = None,
+        degrade_profile: str = "moderate",
+        paired_weight: float = 1.0,
+        val_every: int = 1,
+        val_count: int = 8,
+        val_select: str = "fixed",
+        val_cols: int = 3,
+        val_split: float = 0.15,
+        val_dir_override: str | Path | None = None,
+        val_seed: int = 0,
+        val_layout: str = "rows",
+        keep_best: bool = True,
+        keep_last: int = 3,
+        ema_decay: float = 0.0,
         **arch_overrides: Any,
     ) -> None:
         if arch not in ARCHITECTURES:
             raise ValueError(f"arch must be one of {ARCHITECTURES}, got {arch!r}")
         if head not in HEADS:
             raise ValueError(f"head must be one of {HEADS}, got {head!r}")
+        if val_select not in ("fixed", "random"):
+            raise ValueError(f"val_select must be 'fixed' or 'random', got {val_select!r}")
+        if val_layout not in ("rows", "cols"):
+            raise ValueError(f"val_layout must be 'rows' or 'cols', got {val_layout!r}")
+        if train_mode is not None and train_mode not in TRAIN_MODES:
+            raise ValueError(f"train_mode must be one of {TRAIN_MODES}, got {train_mode!r}")
 
         self.config: ModelConfig = new_arch_config(
             arch,
@@ -193,6 +229,60 @@ class Session:
         self.augment = augment or _augment_from_preset(augment_preset)
         self.snapshot_every = int(snapshot_every)
         self.snapshot_dataset = snapshot_dataset
+        self.paired_weight = float(paired_weight)
+        self.train_mode = train_mode
+        self.degrade = make_config(degrade_profile) if degrade is None else degrade
+        self.degrade.curriculum_epochs = int(epochs)
+        self.keep_best = bool(keep_best)
+        self.keep_last = max(1, int(keep_last))
+        self.ema_decay = float(ema_decay)
+        self._ema_state: dict[str, torch.Tensor] | None = None
+
+        # Paired and sameset derive the source from the target pool, so a
+        # separate source directory is meaningless for them. Rather than break
+        # every existing two-pool script, an *unspecified* mode is resolved from
+        # the arguments actually given: paired for a single pool, unpaired for
+        # two. An explicitly requested mode is always honoured, and rejected
+        # loudly if it cannot work.
+        same_pool = bool(target_dir) and (
+            source_dir is None or Path(source_dir).resolve() == Path(target_dir).resolve()
+        )
+        if train_mode is None:
+            self.train_mode = "paired" if same_pool else "unpaired"
+            if self.train_mode == "unpaired" and source_dir and target_dir:
+                print(
+                    f"note: source_dir and target_dir are different pools, so "
+                    f"train_mode resolved to 'unpaired'. To build the source by "
+                    f"degrading the target pool instead, pass only target_dir "
+                    f"(or train_mode='paired' with matching directories)."
+                )
+        else:
+            self.train_mode = train_mode
+            if train_mode in ("paired", "sameset"):
+                if not target_dir:
+                    raise ValueError(
+                        f"train_mode={train_mode!r} needs target_dir: it is the pool that "
+                        "both the source and the target are drawn from."
+                    )
+                if not same_pool:
+                    raise ValueError(
+                        f"train_mode={train_mode!r} builds the source by degrading images "
+                        f"from the target pool, so source_dir and target_dir must be the "
+                        f"same directory. Got {source_dir!r} and {target_dir!r}. Either "
+                        f"drop source_dir, or use train_mode='unpaired' to train across "
+                        f"two pools."
+                    )
+
+        self.val_config = {
+            "every": int(val_every),
+            "count": int(val_count),
+            "select": val_select,
+            "cols": int(val_cols),
+            "split": float(val_split),
+            "dir": Path(val_dir_override) if val_dir_override else None,
+            "seed": int(val_seed),
+            "layout": val_layout,
+        }
 
         folder = f"{arch}_{head}{'_' + name if name else ''}"
         self.run_dir = Path(runs_root) / folder
@@ -220,6 +310,10 @@ class Session:
     @property
     def log_path(self) -> Path:
         return self.run_dir / "logs" / "train.log"
+
+    @property
+    def validation_dir(self) -> Path:
+        return self.run_dir / "validations"
 
     # ------------------------------------------------------------- kaggle glue
 
@@ -309,11 +403,24 @@ class Session:
             state.last_epoch = int(checkpoint.get("epoch", -1))
             state.global_step = int(checkpoint.get("global_step", 0))
             state.checkpoint_bytes = self.latest.stat().st_size
+            state.saved_loss_version = checkpoint.get("loss_version")
             saved_config = ModelConfig.from_dict(checkpoint.get("model_config", {}))
             if saved_config.arch != self.config.arch or saved_config.head != self.config.head:
                 state.issue = (
                     f"checkpoint holds arch={saved_config.arch}/head={saved_config.head} but "
                     f"this session wants {self.config.arch}/{self.config.head}"
+                )
+            elif (
+                state.saved_loss_version is not None
+                and int(state.saved_loss_version) != LOSS_VERSION
+            ):
+                # Not fatal, but the user must know the two halves of the run
+                # were optimised under different objectives.
+                state.warnings.append(
+                    f"checkpoint was written with loss_version={state.saved_loss_version}, "
+                    f"this build uses {LOSS_VERSION}. The objective changed, so early "
+                    f"epochs and later epochs are not directly comparable. Start a new "
+                    f"run directory for a clean comparison."
                 )
 
         state.preview_count = len(list(self.preview_dir.glob("*.png")))
@@ -404,6 +511,11 @@ class Session:
                 "target_dir": str(self.target_dir) if self.target_dir else None,
                 "val_dir": str(self.val_dir) if self.val_dir else None,
                 "mask_dir": str(self.mask_dir) if self.mask_dir else None,
+                # Bumping this makes older checkpoints visibly non-comparable
+                # instead of silently mixing two different objectives.
+                "loss_version": LOSS_VERSION,
+                "train_mode": self.train_mode,
+                "paired_weight": self.paired_weight,
             },
         )
 
@@ -418,8 +530,10 @@ class Session:
         info = self.plan(mode=mode, extra_epochs=extra_epochs)
         if not info["would_train"]:
             return info
-        if self.source_dir is None or self.target_dir is None:
-            raise ValueError("source_dir and target_dir are required to train")
+        if self.target_dir is None:
+            raise ValueError("target_dir is required to train")
+        if self.train_mode == "unpaired" and self.source_dir is None:
+            raise ValueError("source_dir is required when train_mode='unpaired'")
 
         goal = int(info["target_epoch"])
         seed_everything(self.seed)
@@ -446,16 +560,34 @@ class Session:
                 optimizer_d.load_state_dict(checkpoint["optimizer_d"])
                 start_epoch = int(checkpoint.get("epoch", -1)) + 1
                 global_step = int(checkpoint.get("global_step", 0))
+                saved_ema = checkpoint.get("ema")
+                if saved_ema and self.ema_decay > 0.0:
+                    self._ema_state = {k: torch.as_tensor(v) for k, v in saved_ema.items()}
                 print(f"resumed from {self.latest} (epoch {start_epoch}, step {global_step})")
 
-        train_loader, preview_loader, preview_dataset = make_dataloaders(
+        train_loader, preview_loader, train_dataset, val_loader, val_dataset = make_mode_dataloaders(
             self.source_dir, self.target_dir,
+            train_mode=self.train_mode,
             image_size=self.image_size, batch_size=self.batch_size,
             mask_dir=self.mask_dir, num_workers=self.num_workers, seed=self.seed,
-            augment=self.augment,
+            augment=self.augment, degrade=self.degrade,
+            val_every=self.val_config["every"],
+            val_count=self.val_config["count"],
+            val_select=self.val_config["select"],
+            val_split=self.val_config["split"],
+            val_dir=self.val_config["dir"],
+            val_seed=self.val_config["seed"],
         )
+        preview_dataset = train_dataset
         if len(train_loader) == 0:
             raise ValueError("empty DataLoader; reduce --batch-size or add images")
+        if self.train_mode != "unpaired":
+            print(
+                f"train_mode={self.train_mode}  pool={self.target_dir}  "
+                f"train={len(train_dataset)}  "
+                f"val={len(val_dataset) if val_dataset is not None else 0}  "
+                f"val images are held out and never trained on"
+            )
 
         amp_enabled = bool(self.use_amp and device.type == "cuda")
         scaler = torch.amp.GradScaler("cuda") if amp_enabled else None
@@ -469,6 +601,11 @@ class Session:
         for epoch in range(start_epoch, goal):
             model.train()
             discriminator.train()
+            # Varies the degradation draw every epoch, and drives the curriculum.
+            if hasattr(train_dataset, "set_epoch"):
+                train_dataset.set_epoch(epoch)
+            if hasattr(preview_dataset, "set_epoch"):
+                preview_dataset.set_epoch(epoch)
             reporter.start_epoch(epoch + 1, goal, len(train_loader))
             epoch_start = time.time()
             step_in_epoch = 0
@@ -492,9 +629,16 @@ class Session:
 
                 optimizer_g.zero_grad(set_to_none=True)
                 residual, effect_params, _ = run_generator(model, model_input, mask)
+                deterministic = torch.clamp(source + residual, 0.0, 1.0)
                 styled = self._compose(source, residual, effect_params, training=True)
                 loss_adv = adversarial_loss(discriminator(styled), True)
-                loss_content = content_loss(styled, source, mask if use_mask else None)
+                # L1 half on the pre-effect image so stochastic grain is not
+                # penalised; edge half on the styled image so geometry is
+                # verified end to end. See losses.content_loss.
+                loss_content = content_loss(
+                    styled, source, mask if use_mask else None,
+                    texture_reference=deterministic,
+                )
                 loss_moment = moment_loss(styled, target)
                 target_input = torch.cat([target, torch.zeros_like(mask)], dim=1) if use_mask else target
                 t_residual, _, _ = run_generator(model, target_input, mask)
@@ -503,9 +647,25 @@ class Session:
                     loss_adv + 1.5 * loss_content + 0.35 * loss_moment
                     + 0.75 * loss_identity + 0.02 * effect_regularization(effect_params)
                 )
+                # Direct supervision, only for the images in this batch that
+                # actually have a corresponding target. In sameset most items
+                # do not, so the term is applied per-item rather than per-batch.
+                loss_paired = torch.zeros((), device=device)
+                if self.paired_weight > 0.0 and "is_paired" in batch:
+                    flags = batch["is_paired"].to(device).view(-1, 1, 1, 1)
+                    per_item = paired_reconstruction(
+                        deterministic, target, mask if use_mask else None, reduction="none"
+                    )
+                    active = flags.sum()
+                    if float(active.detach().cpu()) > 0.0:
+                        loss_paired = (per_item * flags).sum() / active
+                        loss_g = loss_g + self.paired_weight * loss_paired
                 loss_g.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer_g.step()
+
+                if self.ema_decay > 0.0:
+                    self._ema_update(model)
 
                 global_step += 1
                 step_in_epoch += 1
@@ -516,6 +676,8 @@ class Session:
                     "content": float(loss_content.detach().cpu()),
                     "identity": float(loss_identity.detach().cpu()),
                 }
+                if float(loss_paired.detach().cpu()) > 0.0:
+                    metrics["paired"] = float(loss_paired.detach().cpu())
                 for key, value in metrics.items():
                     running[key] = running.get(key, 0.0) + value
                 reporter.update(step_in_epoch, metrics)
@@ -531,6 +693,16 @@ class Session:
             )
             self._save(model, discriminator, optimizer_g, optimizer_d, epoch, global_step)
             self._preview(model, preview_loader, device, epoch, global_step, use_mask, name=f"epoch-{epoch+1:04d}")
+
+            if val_loader is not None and self.val_config["every"] > 0 \
+                    and (epoch + 1) % self.val_config["every"] == 0:
+                val_metrics = self._validate(model, val_loader, val_dataset, device, epoch, use_mask)
+                if val_metrics is not None:
+                    append_history(self.validation_dir / "history.csv",
+                                   val_metrics.as_row(epoch + 1))
+                    self._maybe_keep_best(model, discriminator, optimizer_g,
+                                          optimizer_d, epoch, global_step, val_metrics)
+
             if self.snapshot_every > 0 and (epoch + 1) % self.snapshot_every == 0:
                 self._maybe_snapshot(epoch + 1)
 
@@ -732,8 +904,110 @@ class Session:
         save_preview(self.preview_dir / filename, source[0], styled[0], target[0])
         model.train()
 
-    def _save(self, model, discriminator, optimizer_g, optimizer_d, epoch, global_step) -> None:
-        payload = {
+    def _validate(
+        self, model, val_loader, val_dataset, device, epoch: int, use_mask: bool
+    ) -> "ValidationMetrics | None":
+        """Score the held-out set and write one strip image.
+
+        The effects seed is pinned per epoch so two strips are comparable, and
+        the degradation itself is already pinned by the dataset's filename-derived
+        seeds. Without both, epoch N and epoch N+1 would be different problems.
+        """
+
+        if val_loader is None or val_dataset is None or len(val_dataset) == 0:
+            return None
+
+        model.eval()
+        rows: list[dict[str, Any]] = []
+        totals: list[ValidationMetrics] = []
+        with torch.no_grad():
+            for batch in val_loader:
+                source = batch["source"].to(device)
+                target = batch["target"].to(device)
+                mask = batch["mask"].to(device)
+                model_input = torch.cat([source, mask], dim=1) if use_mask else source
+                residual, effect_params, _ = run_generator(model, model_input, mask)
+                deterministic = torch.clamp(source + residual, 0.0, 1.0)
+                styled = apply_stochastic_effects(
+                    deterministic, effect_params,
+                    seed=self.val_config["seed"] + epoch,
+                    strength=self.effects_strength,
+                )
+                totals.append(evaluate_batch(batch, styled, deterministic))
+                paths = batch.get("target_path", [])
+                for i in range(source.shape[0]):
+                    name = Path(paths[i]).name if i < len(paths) else f"{i}"
+                    rows.append({
+                        "index": len(rows) + 1,
+                        "filename": name,
+                        "source": source[i].cpu(),
+                        "output": styled[i].cpu(),
+                        "target": target[i].cpu(),
+                    })
+        model.train()
+
+        if not rows:
+            return None
+        summary = combine_metrics(totals)
+
+        strip = render_strip(
+            rows,
+            columns=self.val_config["cols"],
+            layout=self.val_config["layout"],
+            title=f"validation  epoch {epoch + 1}  {self.train_mode}  "
+                  f"degrade={self.degrade.resolved(epoch).profile}",
+            metrics=summary,
+        )
+        ensure_dir(self.validation_dir)
+        strip.save(self.validation_dir / f"epoch-{epoch + 1:04d}.png")
+        strip.save(self.validation_dir / "latest.png")
+        print(
+            f"validation epoch {epoch + 1}: n={summary.images}  "
+            f"PSNR {summary.psnr:.2f}dB  SSIM {summary.ssim:.4f}  L1 {summary.l1:.4f}  "
+            f"-> {self.validation_dir}/epoch-{epoch + 1:04d}.png"
+        )
+        return summary
+
+    def _maybe_keep_best(
+        self, model, discriminator, optimizer_g, optimizer_d, epoch, global_step,
+        metrics: "ValidationMetrics",
+    ) -> None:
+        """Write ``best.pt`` when validation PSNR improves.
+
+        Only meaningful in ``paired`` mode. In ``sameset`` there is no
+        correspondence between prediction and target, so PSNR is measuring
+        nothing and ranking on it would be meaningless.
+        """
+
+        if not self.keep_best or self.train_mode != "paired":
+            return
+        previous = best_epoch(self.validation_dir / "history.csv")
+        score = _metric_key(metrics)
+        if previous is not None and score <= previous[1]:
+            return
+        self._write_checkpoint(
+            self.checkpoint_dir / "best.pt", model, discriminator,
+            optimizer_g, optimizer_d, epoch, global_step,
+        )
+        print(f"new best validation PSNR {score:.2f}dB -> {self.checkpoint_dir}/best.pt")
+
+    def _ema_update(self, model) -> None:
+        if self._ema_state is None:
+            self._ema_state = {k: v.detach().clone().float()
+                               for k, v in model.state_dict().items()}
+            return
+        decay = self.ema_decay
+        with torch.no_grad():
+            for key, value in model.state_dict().items():
+                if key in self._ema_state and value.dtype.is_floating_point:
+                    self._ema_state[key].mul_(decay).add_(value.detach().float(), alpha=1 - decay)
+                elif key in self._ema_state:
+                    self._ema_state[key] = value.detach().clone()
+
+    def _write_checkpoint(self, path, model, discriminator, optimizer_g, optimizer_d,
+                          epoch, global_step) -> None:
+        ensure_dir(Path(path).parent)
+        torch.save({
             "model": model.state_dict(),
             "discriminator": discriminator.state_dict(),
             "optimizer_g": optimizer_g.state_dict(),
@@ -741,9 +1015,35 @@ class Session:
             "model_config": self.config.to_dict(),
             "epoch": epoch,
             "global_step": global_step,
-        }
-        torch.save(payload, self.latest)
-        torch.save(payload, self.checkpoint_dir / f"epoch-{epoch + 1:04d}.pt")
+            "loss_version": LOSS_VERSION,
+            "train_mode": self.train_mode,
+            "ema": self._ema_state,
+        }, path)
+
+    def _save(self, model, discriminator, optimizer_g, optimizer_d, epoch, global_step) -> None:
+        self._write_checkpoint(self.latest, model, discriminator, optimizer_g,
+                               optimizer_d, epoch, global_step)
+        self._write_checkpoint(
+            self.checkpoint_dir / f"epoch-{epoch + 1:04d}.pt", model, discriminator,
+            optimizer_g, optimizer_d, epoch, global_step,
+        )
+        self._prune_checkpoints()
+
+    def _prune_checkpoints(self) -> None:
+        """Keep the newest ``keep_last`` epoch files; ``best.pt`` is never touched.
+
+        60 epochs of a 17 MB checkpoint is a gigabyte, which fills Kaggle's disk
+        and makes every snapshot slow.
+        """
+
+        if self.keep_last <= 0:
+            return
+        files = sorted(self.checkpoint_dir.glob("epoch-*.pt"))
+        for stale in files[: max(0, len(files) - self.keep_last)]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------- misc
 
