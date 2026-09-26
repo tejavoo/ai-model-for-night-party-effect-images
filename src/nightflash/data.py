@@ -218,11 +218,15 @@ class DegradationDataset(Dataset[dict[str, Any]]):
         degrade: "DegradeConfig | None" = None,
         epoch: int = 0,
         deterministic_seed: bool = False,
+        paths: list[Path] | None = None,
     ) -> None:
         if mode not in ("paired", "sameset"):
             raise ValueError(f"DegradationDataset mode must be paired or sameset, got {mode!r}")
         self.target_dir = Path(target_dir).expanduser().resolve()
-        self.paths = list_images(self.target_dir)
+        # An explicit path list is used verbatim, so the sameset fallback check
+        # below sees the *split* and not the whole directory. A held-out split
+        # of one image must fall back, or randrange(0) is reached below.
+        self.paths = list(paths) if paths is not None else list_images(self.target_dir)
         if not self.paths:
             raise FileNotFoundError(f"no images in {self.target_dir}")
         self.mode = mode
@@ -242,7 +246,7 @@ class DegradationDataset(Dataset[dict[str, Any]]):
             self._fell_back = True
             print(
                 f"warning: sameset needs at least 2 images to draw a different source, "
-                f"{self.target_dir} has {len(self.paths)}. Falling back to paired."
+                f"got {len(self.paths)} from {self.target_dir}. Falling back to paired."
             )
 
     @property
@@ -503,5 +507,4 @@ class _PoolDataset(DegradationDataset):
         if not paths:
             raise ValueError("cannot build a dataset from an empty path list")
         self._paths = list(paths)
-        super().__init__(paths[0].parent, **kwargs)
-        self.paths = self._paths
+        super().__init__(paths[0].parent, paths=self._paths, **kwargs)

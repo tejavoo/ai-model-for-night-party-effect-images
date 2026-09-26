@@ -698,10 +698,13 @@ class Session:
                     and (epoch + 1) % self.val_config["every"] == 0:
                 val_metrics = self._validate(model, val_loader, val_dataset, device, epoch, use_mask)
                 if val_metrics is not None:
-                    append_history(self.validation_dir / "history.csv",
-                                   val_metrics.as_row(epoch + 1))
+                    # Keep-best must read the history *before* this epoch is
+                    # appended, or it compares the current score against itself
+                    # and never writes on the first epoch.
                     self._maybe_keep_best(model, discriminator, optimizer_g,
                                           optimizer_d, epoch, global_step, val_metrics)
+                    append_history(self.validation_dir / "history.csv",
+                                   val_metrics.as_row(epoch + 1))
 
             if self.snapshot_every > 0 and (epoch + 1) % self.snapshot_every == 0:
                 self._maybe_snapshot(epoch + 1)

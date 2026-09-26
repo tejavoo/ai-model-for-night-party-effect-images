@@ -168,8 +168,18 @@ def apply_geometry(
             scaled = padded
         width, height = scaled.size
 
-    left = rng.randint(0, width - size) if width > size else (width - size) // 2
-    top = rng.randint(0, height - size) if height > size else (height - size) // 2
+    # The crop offset is part of the warp, not a separate random draw. Reading
+    # it from `params` is what lets `make_pair` apply a genuinely identical
+    # transform to the source and the target; drawing it from `rng` here would
+    # give the two images different offsets, which silently destroys the
+    # correspondence in `paired` mode.
+    if "crop" in params:
+        fx, fy = params["crop"]
+        left = int(round(float(fx) * max(0, width - size)))
+        top = int(round(float(fy) * max(0, height - size)))
+    else:
+        left = rng.randint(0, width - size) if width > size else (width - size) // 2
+        top = rng.randint(0, height - size) if height > size else (height - size) // 2
     out = scaled.crop((left, top, left + size, top + size))
 
     degrees = params.get("degrees", 0.0)
@@ -241,11 +251,19 @@ def make_pair(
 ) -> tuple[Image.Image, Image.Image, Image.Image | None]:
     """Apply one shared geometric warp to source, target and optional mask.
 
+    "Shared" covers the crop offset as well as scale, rotation and flips. The
+    offset is sampled once here as a fraction and clamped independently inside
+    :func:`apply_geometry`, so two images of different sizes still receive the
+    same relative crop. That is what keeps a ``paired`` sample's source and
+    target describing the same region of the same scene.
+
     Colour jitter is applied to the source only unless explicitly overridden,
     because the target carries the style signal.
     """
 
     params = _sample_geometry(config, rng)
+    # Fractional crop origin, so it transfers between differently sized images.
+    params["crop"] = (rng.random(), rng.random())
 
     warped_source = apply_geometry(source, size, params, rng)
     warped_target = apply_geometry(target, size, params, rng)
