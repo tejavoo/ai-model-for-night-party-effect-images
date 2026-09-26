@@ -176,21 +176,82 @@ whole-frame result.
 
 ### Choosing a tile size
 
-| tile | overlap | good for | tiles on 4032×3024 |
-|---:|---:|---|---:|
-| 256 | 64 | matches a 256px training run | 336 |
-| 512 | 128 | a 512px model, or a good balance | 88 |
-| 1024 | 256 | a 1024px model, large frames | 24 |
+**Match the tile to `--image-size`.** This is the one rule that matters. A model
+trained on 256px crops has learned the feature statistics of 256px crops; feed
+it a different tile size and you are outside that distribution.
 
-Match the tile to `--image-size`. A 256px model asked to process 1024px tiles is
-being run far outside its training scale, and the receptive-field argument from
-above applies inside the tile.
+| trained at | infer with | result |
+|---|---|---|
+| 256 crops | 256 tiles | **Correct.** Same feature statistics, smooth Hann blend. |
+| 256 crops | 512 tiles | Degraded. Larger context than the model ever saw. |
+| 1024 images | 256 tiles | Worst. Objects appear cropped in ways never seen in training. |
+
+`Session.infer` warns when `tile != image_size` rather than blocking, because
+running a large tile through a small-crop model is occasionally useful.
+
+Cost on a 4032×3024 source, measured:
+
+| tile | overlap | overlap ratio | tiles | MP processed |
+|---:|---:|---:|---:|---:|
+| 256 | 64 | 25% | 336 | 22.0 |
+| 256 | 128 (default) | 50% | 713 | 46.7 |
+| 512 | 128 | 25% | 88 | 23.1 |
+| 1024 | 256 | 25% | 20 | 21.0 |
+
+What matters is the overlap **ratio**, not its absolute size: the three 25% rows
+all land near 22 MP, and going to 50% roughly doubles it to 46.7. Use a 25%
+ratio for speed on a batch, 50% when the output quality matters.
+
+Note that cost scales with the source, not with `tile`: tiling a 12MP photo
+means running the network over 22-47 megapixels, which is more than five to
+eleven full passes over the whole image.
 
 The trainer prints the cost before it starts:
 
 ```text
 big.jpg (1600, 1200) -> tiled: 12 tiles of 512px, 3.1 MP processed
 ```
+
+### Padding outside the frame
+
+Edge tiles must be a full `tile_size`, so something has to fill the part that
+hangs off the photograph. `pad_mode` chooses what the model sees there:
+
+| mode | behaviour | when |
+|---|---|---|
+| `edge` (default) | replicate the border row/column | safe; never invents a gradient, never a black bar |
+| `reflect` | mirror the border | strong vertical structure, where a repeated column is visible |
+| `black` | zero fill | only correct if the model was trained on padded black borders |
+
+`reflect` silently falls back to `edge` when the pad would exceed the axis it is
+mirroring, which reflection cannot do.
+
+### Borders do not fade to black
+
+A Hann window tapers to zero at its edges, so naively crossfading tiles fades the
+frame border towards black. Two mechanisms prevent it here, so you do **not**
+need to pre-pad the image with reflection yourself:
+
+1. the window has a positive floor (1e-3), so weights never vanish;
+2. edge tiles extend past the frame and are padded, so the frame border is never
+   a tile border.
+
+Verified: a 255-valued border strip survives tiled inference at 254.6/255, with
+worst-case error 1.0. A fade would show near 0.
+
+### Downscaling while tiling
+
+`max_edge` shrinks the long edge, preserving aspect ratio, *before* tiling. Use
+it to batch many images, or to match a model trained at a small `image_size`:
+
+```python
+s.infer("12mp.jpg", max_edge=1024)                  # 4032x3024 -> 1024x768
+s.infer("12mp.jpg", max_edge=1024, tile=256)       # downscale AND tile
+s.infer("huge/", max_edge=2048, seeds=2)
+```
+
+It never upscales: `max_edge=4096` on a 300×200 photo returns 300×200. Aspect
+ratio is preserved to within 0.005 on the sizes that matter.
 
 ### What tiling changes semantically
 

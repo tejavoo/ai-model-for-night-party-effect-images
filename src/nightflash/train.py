@@ -9,6 +9,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from .arch import run_generator
 from .config import ModelConfig, TrainPaths
 from .data import make_dataloaders
 from .effects import apply_stochastic_effects
@@ -143,7 +144,9 @@ def _run_preview(
         source = batch["source"].to(device)
         target = batch["target"].to(device)
         mask = batch["mask"].to(device)
-        residual, effect_params = model(_model_input(source, mask, use_mask))
+        residual, effect_params, _ = run_generator(
+            model, _model_input(source, mask, use_mask)
+        )
         deterministic = torch.clamp(source + residual, 0.0, 1.0)
         styled = apply_stochastic_effects(
             deterministic,
@@ -256,7 +259,7 @@ def train(args: argparse.Namespace) -> Path:
             # Discriminator update.
             optimizer_d.zero_grad(set_to_none=True)
             with _autocast(device, amp_enabled):
-                residual, effect_params = model(model_input)
+                residual, effect_params, _ = run_generator(model, model_input)
                 deterministic = torch.clamp(source + residual, 0.0, 1.0)
                 styled = apply_stochastic_effects(
                     deterministic,
@@ -280,7 +283,7 @@ def train(args: argparse.Namespace) -> Path:
             # Generator update.
             optimizer_g.zero_grad(set_to_none=True)
             with _autocast(device, amp_enabled):
-                residual, effect_params = model(model_input)
+                residual, effect_params, _ = run_generator(model, model_input)
                 deterministic = torch.clamp(source + residual, 0.0, 1.0)
                 styled = apply_stochastic_effects(
                     deterministic,
@@ -296,7 +299,7 @@ def train(args: argparse.Namespace) -> Path:
                     target_input = torch.cat([target, torch.zeros_like(mask)], dim=1)
                 else:
                     target_input = target
-                target_residual, _ = model(target_input)
+                target_residual, _, _ = run_generator(model, target_input)
                 target_identity = torch.clamp(target + target_residual, 0.0, 1.0)
                 loss_identity = identity_loss(target_identity, target)
                 loss_effect = effect_regularization(effect_params)

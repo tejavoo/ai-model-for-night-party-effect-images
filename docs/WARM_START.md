@@ -173,6 +173,36 @@ Set --epochs to 41 + the number of extra epochs you want.
 
 Rule of thumb: `new_epochs = checkpoint["epoch"] + 1 + extra_epochs_you_want`.
 
+### The same rule in `Session` and `nf`
+
+`Session` applies the identical rule, and it is the one to watch on Kaggle where
+sessions are short:
+
+| call | meaning | at epoch 40 it |
+|---|---|---|
+| `s.train()` | **absolute** — go to `Session.epochs` | trains nothing if `epochs <= 40` |
+| `s.train(extra_epochs=20)` | **relative** — 20 more | trains epochs 41–60 |
+| `nf train --epochs 80` | **absolute** | trains 41–80 |
+| `nf train --extra-epochs 20` | **relative** | trains 41–60 |
+
+`extra_epochs=0` is a deliberate no-op, not a rerun. Both `Session` and `nf`
+refuse a no-op rather than pretending to succeed:
+
+```
+refusing to train: NO-OP GUARD - already at epoch 40; target 40 would train
+zero epochs. Ask for more epochs.
+```
+
+Use `extra_epochs` for the resume path. It cannot overshoot, because it is
+computed from the checkpoint's own epoch at call time.
+
+### Across Kaggle sessions
+
+On Kaggle `/kaggle/working` is wiped, so the resume path is
+`snapshot_every=N` plus `s.auto_resume()`. See
+[`KAGGLE.md`](KAGGLE.md#resuming-across-sessions) and
+[`QuickStartKaggle.md`](QuickStartKaggle.md#session-2-resume).
+
 ### What correctly survives a resume
 
 Verified behaviour:

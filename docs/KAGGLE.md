@@ -1,6 +1,7 @@
 # Kaggle
 
-Same six cells as Colab. Only the data plumbing differs, because Kaggle wipes
+Same seven cells as Colab. Only the data plumbing and the snapshot lines differ,
+because Kaggle wipes
 `/kaggle/working` between sessions and you attach data as a Dataset rather than
 mounting a drive.
 
@@ -71,30 +72,58 @@ turns "which head is better" into a same-wall-clock experiment.
 
 ## Resuming across sessions
 
-`/kaggle/working` does not survive. Snapshot the run out, attach it next time,
-restore it in.
+`/kaggle/working` does not survive. The automated form is two settings and one
+call.
 
-**End of a session:**
+**In `Session`, at construction:**
 
 ```python
-from nightflash.kaggle import snapshot
-snapshot(s.run_dir)
+s = Session(..., snapshot_every=1)     # publish a Dataset version every epoch
 ```
 
-This publishes the run directory as a new version of a Kaggle Dataset. First call
-creates the dataset; later calls add versions. Requires `~/.kaggle/kaggle.json`
-or `KAGGLE_USERNAME` / `KAGGLE_KEY`.
-
-**Start of the next session**, after attaching that dataset in the panel:
+**At the start of every session, including the first:**
 
 ```python
-from nightflash.kaggle import restore
-restore(s.run_dir)          # archives anything already there, then copies back
-s.train(extra_epochs=40)    # resumes where the last session stopped
+s.auto_resume()                          # restore if a snapshot is attached
+s.train(extra_epochs=40)                 # relative: 40 more from where it stopped
+```
+
+`snapshot_every=1` is what makes this safe: a session that dies at epoch 41 of
+60 costs you one epoch, not forty-one. Raise it to `5` if you hit API rate
+limits.
+
+`s.auto_resume()` matches the attached dataset to the run by name, ignoring case
+and `-`/`_`, so the auto-generated slug `nightflash-edgehat-freqsplit-night` is
+recognised for the run directory `edgehat_freqsplit_night`. It accepts a sole
+candidate under any other name, refuses to guess when two candidates are
+attached and neither matches, and prints `starting fresh` when there is nothing
+to restore. Outside Kaggle it reports that and does nothing, so the same cell is
+safe in Colab.
+
+Snapshots need credentials in `/root/.kaggle/kaggle.json`. Without them the
+per-epoch hook prints a warning and training continues, because losing an hour
+of training to a network error would be a bad trade.
+
+### The explicit calls
+
+If you would rather drive it yourself:
+
+```python
+from nightflash.kaggle import snapshot, restore
+
+snapshot(s.run_dir)          # publish a new Dataset version
+restore(s.run_dir)           # archives anything already there, then copies back
+s.snapshot(note="epoch 40")  # or through the session, non-fatal on error
 ```
 
 `restore` archives the existing directory first, so you cannot accidentally
-overwrite a resumed run with a stale copy.
+overwrite a resumed run with a stale copy. `s.snapshot()` swallows failures by
+default and tells you where the run still is; pass `strict=True` to raise.
+
+CLI: `nf snapshot --name a`, `nf resume --name a`, `nf resume --name a --required`.
+
+See `docs/QuickStartKaggle.md` for the full flow, both-GPU setup and the command
+cookbook.
 
 ---
 
@@ -132,17 +161,21 @@ s = Session(arch="edgehat", head="freqsplit", name="night",
             source_dir=SOURCE_DIR, target_dir=TARGET_DIR,
             runs_root=Path("/kaggle/working/runs"),
             image_size=256, batch_size=8, epochs=50,
-            device=recommended_device("auto"))
+            device="auto",
+            augment_preset="default",
+            snapshot_every=1)       # publish a Dataset version every epoch
 
-# 4. read the briefing
-print(brief(s, mode="plan"))
+# 4. restore the last snapshot (or start fresh), then read the briefing
+s.auto_resume()
+print(brief(s, mode="train"))
 
 # 5. train
 s.train(extra_epochs=20)          # session budget is ~12 h, not 50 epochs
 
-# 6. inspect
+# 6. inspect and keep
+s.infer(SOURCE_DIR, seeds=2, save_comparison=True)
 show_previews(s.run_dir, n=4)
-snapshot(s.run_dir)                # so the next session can continue
+s.snapshot(note="final")
 ```
 
 Note `epochs=50` with `extra_epochs=20` in the same breath: `epochs` is the

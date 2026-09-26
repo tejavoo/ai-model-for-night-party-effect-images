@@ -137,6 +137,83 @@ def restore(run_dir: str | Path, *, dataset_dir: str | Path | None = None) -> Pa
     return run_dir
 
 
+def _normalise(name: str) -> str:
+    """Fold a dataset slug and a run directory name to the same comparable key.
+
+    Kaggle dataset slugs are lowercased with ``_`` turned into ``-``, so the
+    default slug for ``runs/edgehat_freqsplit_night`` is
+    ``nightflash-edgehat-freqsplit-night``. Comparing raw names would never
+    match, so both sides are folded to bare alphanumerics.
+    """
+
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def find_snapshot(run_dir: str | Path) -> Path | None:
+    """Locate an attached snapshot that matches ``run_dir``, or ``None``.
+
+    Matching ignores case and separator style, and accepts the ``nightflash-``
+    prefix that :func:`snapshot` adds, so a notebook with several arms attached
+    at once restores the right one. A dataset holding ``checkpoints/latest.pt``
+    but no matching name is accepted only when it is the sole candidate, which
+    keeps working when a snapshot was uploaded by hand under another name.
+    """
+
+    if not INPUT.exists():
+        return None
+    wanted = _normalise(Path(run_dir).name)
+    named: list[Path] = []
+    loose: list[Path] = []
+    for entry in sorted(INPUT.iterdir()):
+        if not (entry / "checkpoints" / "latest.pt").exists():
+            continue
+        key = _normalise(entry.name)
+        if key == wanted or key.endswith(wanted) or wanted.endswith(key):
+            named.append(entry)
+        else:
+            loose.append(entry)
+    if named:
+        return named[0]
+    if len(loose) == 1:
+        return loose[0]
+    return None
+
+
+def auto_restore(run_dir: str | Path, *, required: bool = False) -> Path | None:
+    """Restore a snapshot if one is attached, otherwise do nothing.
+
+    This is the "just keep going" counterpart to :func:`restore`. Call it at the
+    top of every new session instead of remembering to restore by hand::
+
+        from nightflash.kaggle import auto_restore
+        auto_restore(s.run_dir)
+
+    Returns the restored path, or ``None`` if there was nothing to restore (a
+    normal first session). With ``required=True`` a missing snapshot is an
+    error instead, which is what you want in the *last* session before you
+    export.
+    """
+
+    if not is_kaggle():
+        if required:
+            raise RuntimeError("auto_restore(required=True) outside a Kaggle runtime")
+        return None
+
+    source = find_snapshot(run_dir)
+    if source is None:
+        if required:
+            raise FileNotFoundError(
+                f"no attached snapshot matches {Path(run_dir).name}. Attach the "
+                "dataset in the notebook's right-hand Settings panel, or pass "
+                "required=False to start fresh."
+            )
+        print(f"no attached snapshot for {Path(run_dir).name}; starting fresh")
+        return None
+
+    restore(run_dir, dataset_dir=source)
+    return Path(run_dir)
+
+
 def environment_report() -> dict[str, object]:
     """Everything worth printing at the top of a Kaggle notebook."""
 

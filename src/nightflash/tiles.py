@@ -123,8 +123,22 @@ def blend_window(box: TileBox, floor: float = 1e-3) -> np.ndarray:
     return np.maximum(window, floor)
 
 
-def extract_tile(image: Image.Image, box: TileBox) -> tuple[Image.Image, TileBox]:
-    """Crop ``box`` from ``image``, edge-replicating where it runs off-frame."""
+def extract_tile(
+    image: Image.Image, box: TileBox, pad_mode: str = "edge"
+) -> tuple[Image.Image, TileBox]:
+    """Crop ``box`` from ``image``, padding where it runs off-frame.
+
+    ``pad_mode`` controls what the model sees outside the frame:
+
+    ``edge``
+        Replicate the border row/column. The safe default; never invents a
+        gradient and never introduces a hard black bar.
+    ``reflect``
+        Mirror the border. Often better for images with strong vertical
+        structure, but it can create a visible mirrored continuation.
+    ``black``
+        Zero fill. Only correct if the model was trained on padded black borders.
+    """
 
     valid_left = max(0, box.left)
     valid_top = max(0, box.top)
@@ -139,26 +153,36 @@ def extract_tile(image: Image.Image, box: TileBox) -> tuple[Image.Image, TileBox
 
     if pad_left or pad_top or pad_right or pad_bottom:
         array = np.asarray(inner, dtype=np.uint8)
-        # 'edge' replicates the border row/column, which is what a real photo
-        # would plausibly continue with, and keeps the model away from black bars.
+        if pad_mode == "black":
+            mode = "constant"
+        elif pad_mode == "reflect":
+            height, width = array.shape[:2]
+            if pad_top >= height or pad_bottom >= height or pad_left >= width or pad_right >= width:
+                mode = "edge"  # reflection cannot exceed the axis length
+            else:
+                mode = "reflect"
+        else:
+            mode = "edge"
         array = np.pad(
             array,
             ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
-            mode="edge",
+            mode=mode,
         )
         inner = Image.fromarray(array, mode="RGB")
 
     visible = TileBox(
-        pad_left, pad_top, pad_left + (valid_right - valid_left), pad_top + (valid_bottom - valid_top)
+        pad_left, pad_top,
+        pad_left + (valid_right - valid_left),
+        pad_top + (valid_bottom - valid_top),
     )
     return inner, visible
 
 
 def iter_tiles(
-    image: Image.Image, tile_size: int, overlap: int
+    image: Image.Image, tile_size: int, overlap: int, pad_mode: str = "edge"
 ) -> Iterator[tuple[TileBox, Image.Image]]:
     for box in tile_boxes(image.width, image.height, tile_size, overlap):
-        tile, _ = extract_tile(image, box)
+        tile, _ = extract_tile(image, box, pad_mode)
         yield box, tile
 
 
@@ -172,12 +196,13 @@ def apply_tiled(
     *,
     tile_size: int = 512,
     overlap: int = 128,
+    pad_mode: str = "edge",
     progress: Callable[[int, int], None] | None = None,
 ) -> Image.Image:
     """Run ``process`` over overlapping tiles and crossfade the results.
 
-    ``process`` receives a full ``tile_size`` tile (edge-replicated where the
-    tile runs past the frame) and must return a same-sized image.
+    ``process`` receives a full ``tile_size`` tile (padded per ``pad_mode`` where
+    the tile runs past the frame) and must return a same-sized image.
     """
 
     boxes = tile_boxes(image.width, image.height, tile_size, overlap)
@@ -185,7 +210,7 @@ def apply_tiled(
     weights = np.zeros((image.height, image.width), dtype=np.float64)
 
     for index, box in enumerate(boxes, start=1):
-        tile, visible = extract_tile(image, box)
+        tile, visible = extract_tile(image, box, pad_mode)
         result = process(tile)
         if result.size != tile.size:
             raise ValueError(

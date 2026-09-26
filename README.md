@@ -12,35 +12,53 @@ The app already has a deterministic Core ML color transform plus Core Image/Visi
 
 ## What this repository contains
 
-- Hybrid convolutional + MobileViT/EdgeViT-style generator
+- `edgehat` generator: EdgeViT-style local windowed attention plus one HAT
+  overlapping cross-attention block
 - Bounded RGB residual prediction
+- Four head families and three composites (see [Heads](#heads))
+- Three switchable capabilities: halation, subject gate, region exposure
 - Small stochastic-effect coefficient head
 - Seeded procedural grain, leak, exposure, saturation, and vignette renderer
-- Unpaired PatchGAN training
-- Content, identity, edge, and batch-statistics losses
+- Unpaired PatchGAN training with content, identity, edge, and batch-statistics
+  losses
+- Geometric augmentation with a shared warp across source, target and mask
 - Mid-training preview generation
-- Checkpoint/resume support
-- Single-image and batch-directory inference
+- Checkpoint/resume, plus Kaggle snapshot/restore for cross-session survival
+- Whole-frame, tiled, and downscale-then-tiled inference
 - Evaluation diagnostics
-- Core ML export to `.mlpackage` and `.mlmodel`
+- Core ML export to `.mlpackage` and `.mlmodel`, with a PyTorch-vs-Core-ML
+  validator
 - Optional Textual terminal UI
-- Colab and local documentation
+- Colab, Kaggle, and local documentation
 
 ## Design decision
 
-The recommended architecture is deliberately hybrid:
+The model predicts a **bounded residual** on top of the input, then a seeded
+stochastic renderer adds grain and light leaks:
 
 ```text
 source image
 → convolutional encoder
-→ small low-resolution global transformer
-→ residual decoder
+→ local windowed attention + one global cross-attention block
+→ head (tanh | per-pixel | freq-split | 3D LUT | composite)
 → learned style residual
 → seeded stochastic effects
-→ existing Core Image/Metal finishing
+→ existing Core Image / Vision finishing
 ```
 
-The model is not intended to replace the entire camera pipeline. Keep the existing Vision person mask and Core Image effects in the app.
+Two decisions are worth defending:
+
+- **Bounded residual.** The output is `clamp(source + residual)`, so the model
+  learns a *modification* rather than a whole image. That is what protects
+  faces, text, and geometry, and it is why identity stays stable even when the
+  style is aggressive.
+- **Not a pure per-pixel network.** Grain and halation live in the high
+  frequency band, which a per-pixel head represents poorly. The default
+  `freqsplit` head predicts low / mid / high bands separately and recombines
+  them, so each band gets the resolution it needs.
+
+The model is not intended to replace the entire camera pipeline. Keep the
+existing Vision person mask and Core Image effects in the app.
 
 ## Quick start
 
@@ -58,52 +76,67 @@ Create tiny synthetic data and run a smoke test:
 python scripts/smoke_test.py
 ```
 
-Train on real unpaired data:
+Everything else goes through one object:
 
-```bash
-nightflash-train \
-  --source-dir /path/to/normal-photos \
-  --target-dir /path/to/disposable-photos \
-  --output-dir runs/nightflash \
-  --image-size 256 \
-  --batch-size 8 \
-  --epochs 50
+```python
+from nightflash import Session
+from nightflash.briefing import brief
+
+s = Session(
+    source_dir="/path/to/normal-photos",
+    target_dir="/path/to/disposable-photos",
+    arch="edgehat", head="freqsplit", name="night",
+    image_size=256, batch_size=8, epochs=50,
+)
+
+print(brief(s, mode="plan"))   # read this before spending GPU hours
+s.train()                       # go to epochs=50, resuming if a checkpoint exists
+s.infer("photo.jpg", seeds=3)   # inference only, never touches the trainer
 ```
 
-Run inference from a checkpoint:
+The same from a terminal:
 
 ```bash
-nightflash-infer \
-  --checkpoint runs/nightflash/checkpoints/latest.pt \
-  --input /path/to/test-photo.jpg \
-  --output outputs/test-photo-nightflash.png \
-  --seed 12345
+nf brief  --source-dir SRC --target-dir TGT          # the pre-flight briefing
+nf train  --source-dir SRC --target-dir TGT --epochs 50
+nf infer  --input photo.jpg --seeds 3
 ```
 
-Run the terminal UI:
+Each run gets its own folder, so switching architecture or head never
+overwrites another run:
 
-```bash
-nightflash-tui
+```text
+runs/edgehat_freqsplit_night/
+  config.json  checkpoints/  previews/  inferences/  evaluations/  logs/
 ```
+
+Legacy standalone entry points still exist for older checkpoints and are
+documented in [`docs/TRAINING.md`](docs/TRAINING.md): `nightflash-train`,
+`nightflash-infer`, `nightflash-evaluate`, `nightflash-export-coreml`,
+`nightflash-validate-coreml`, `nightflash-tui`. Prefer `nf` and `Session` for
+anything new.
 
 ## Documentation
 
-Read these in order:
-
-1. [`docs/PLAN.md`](docs/PLAN.md) — recommended implementation phases
-2. [`docs/DATA.md`](docs/DATA.md) — unpaired dataset preparation
-3. [`docs/DATASET_SOURCING.md`](docs/DATASET_SOURCING.md) — how `training_photos/` was built, and the target-domain gap
-4. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the `edgehat` model, heads, and capabilities
-5. [`docs/CLI.md`](docs/CLI.md) — `Session`, the pre-flight briefing, and the `nf` command
-6. [`docs/TRAINING.md`](docs/TRAINING.md) — local training and mid-training inference
-7. [`docs/COLAB.md`](docs/COLAB.md) — Google Colab notebook, CLI, and MCP
-8. [`docs/KAGGLE.md`](docs/KAGGLE.md) — Kaggle setup, T4×2, cross-session resume
-9. [`docs/WARM_START.md`](docs/WARM_START.md) — resuming, warm starting, changing resolution
-10. [`docs/INFERENCE.md`](docs/INFERENCE.md) — testing, seeds, aspect ratio
-11. [`docs/EVALUATION.md`](docs/EVALUATION.md) — quality and performance evaluation
-12. [`docs/COREML.md`](docs/COREML.md) — Core ML export and iOS integration
+1. [`docs/QuickStartKaggle.md`](docs/QuickStartKaggle.md) — **start here for Kaggle**: full flow, both GPUs, command cookbook
+2. [`docs/PLAN.md`](docs/PLAN.md) — recommended implementation phases
+3. [`docs/DATA.md`](docs/DATA.md) — unpaired dataset preparation
+4. [`docs/DATASET_SOURCING.md`](docs/DATASET_SOURCING.md) — how `training_photos/` was built, and the target-domain gap
+5. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the `edgehat` model, heads, and capabilities
+6. [`docs/CLI.md`](docs/CLI.md) — `Session`, the pre-flight briefing, and the `nf` command
+7. [`docs/TRAINING.md`](docs/TRAINING.md) — augmentation, loss weights, mid-training inference
+8. [`docs/COLAB.md`](docs/COLAB.md) — Google Colab notebook, CLI, and MCP
+9. [`docs/KAGGLE.md`](docs/KAGGLE.md) — Kaggle setup, T4×2, cross-session resume
+10. [`docs/WARM_START.md`](docs/WARM_START.md) — resuming, warm starting, changing resolution
+11. [`docs/INFERENCE.md`](docs/INFERENCE.md) — whole-frame, tiled, downscaled inference
+12. [`docs/EVALUATION.md`](docs/EVALUATION.md) — quality and performance evaluation
+13. [`docs/COREML.md`](docs/COREML.md) — Core ML export and iOS integration
+14. [`docs/TUI.md`](docs/TUI.md) — the optional terminal UI
 
 ## Quick start: one object
+
+Everything is driven by a single `Session`. It owns a run directory, so
+experiments never collide and resuming is just calling it again.
 
 ```python
 from nightflash import Session
@@ -116,26 +149,17 @@ s = Session(
 )
 
 print(brief(s, mode="plan"))   # read this before training
-s.train()                       # resume, or start fresh
-s.train(extra_epochs=50)        # resume and add 50 more
+s.train()                       # absolute: go to epochs=50
+s.train(extra_epochs=50)        # relative: add 50 from wherever it is
 s.infer("photo.jpg", seeds=3)   # inference only, no training
+s.state()                       # one-line status, writes nothing
+s.reset()                       # archive, never delete
 ```
 
-The same thing from a terminal:
-
-```bash
-nf brief
-nf train --source-dir data/source --target-dir data/target --epochs 50
-nf infer --input photo.jpg --seeds 3
-```
-
-Each run gets its own folder, so switching architectures never overwrites
-another run:
-
-```text
-runs/edgehat_freqsplit_night/
-  config.json  checkpoints/  previews/  inferences/  evaluations/  logs/
-```
+`epochs=50` is an **absolute** target: asking for it again at epoch 50 is a
+no-op, not another 50 epochs. `extra_epochs=N` is **relative**, which is the
+resume path. Mixing those up is how a run silently trains forever, so the
+briefing prints both before you start.
 
 ## Architectures and heads
 
@@ -143,14 +167,16 @@ runs/edgehat_freqsplit_night/
 |---|---:|---|
 | `edgehat` (default) | 4.02 M | local windows + one HAT global block |
 | `swinir` | 4.90 M | windowed, relative position bias |
-| `restormer` | 0.76 M | over channels |
-| `hybrid` | 0.76 M | pooled tokens, keeps older checkpoints |
+| `restormer` | 0.76 M | over channels (legacy) |
+| `hybrid` | 0.76 M | pooled tokens, keeps older checkpoints (legacy) |
+
+### Heads
 
 | head | learns | params |
 |---|---|---:|
 | `freqsplit` (default) | low / mid / high bands separately | 63 k |
-| `perpixel` | unbounded per-pixel delta | 42 k |
-| `lut3d` | 33³ colour LUT **+ per-pixel conv** | 129 k |
+| `perpixel` | per-pixel RGB delta, unclamped until read | 42 k |
+| `lut3d` | 33³ trilinear colour LUT **+ per-pixel delta** | 129 k |
 | `tanh` | bounded delta, most conservative | 21 k |
 
 Composite heads combine with `+`:
@@ -161,34 +187,83 @@ Composite heads combine with `+`:
 | `lut3d+perpixel` | 171 k | global grade + unconstrained local delta |
 | `tanh+freqsplit` | 84 k | band-separated, everything bounded |
 
-Three capabilities, each independently switchable:
+`perpixel+freqsplit` is deliberately absent: both are per-pixel, so it adds
+parameters without adding a distinct inductive bias.
 
-- **halation** — thresholded highlight, dilated spread, warm tint
-- **subject gate** — soft `S(x,y)`, guided by a Vision mask when supplied
-- **region exposure** — 4×4 coefficients, bilinearly upsampled
+The 3D LUT uses **explicit trilinear gathers**, not `grid_sample` — see
+[`docs/COREML.md`](docs/COREML.md) for why.
+
+### Capabilities
+
+Three, each independently switchable, each gated by a zero-initialised mix
+scalar so a fresh model starts as a no-op:
+
+| capability | what it does |
+|---|---|
+| **halation** | thresholded highlight, physically dilated spread, warm tint |
+| **subject gate** | soft `S(x,y)`, guided by a Vision mask when supplied |
+| **region exposure** | 4×4 coefficients, bilinearly upsampled |
+
+The zero-init gate is what makes them safe to enable by default: the model
+cannot regress on a capability it has not yet learned to use.
+
+## Augmentation
+
+One geometric warp per item, applied **identically to the source, the target and
+the mask** — otherwise an unpaired batch describes two different scenes and the
+content losses contradict each other.
+
+```bash
+--augment default        # scale 0.8-1.25, rot +/-12deg, hflip + vflip
+--augment conservative   # scale 0.9-1.15, rot +/-6deg,  hflip + vflip
+--augment strong         # wider, + colour jitter + 2 cutout holes
+--augment none           # deterministic centre crop
+```
+
+Colour jitter is **off by default, on purpose**. The target domain *is* a colour
+look; perturbing it teaches the discriminator that the style is fuzzy. Full
+rationale and every bound in [`docs/TRAINING.md`](docs/TRAINING.md#augmentation).
 
 ## Common tasks
 
+### Inference
+
 ```bash
-# Inference: whole frame (nothing cropped, but downscaled to --image-size)
-nf infer --input photo.jpg --output out.png
+# Whole frame (default): nothing cropped or stretched, exact original size
+nf infer --input photo.jpg
 
-# Inference: tiled, for real high-frequency detail
-nf infer --input big.jpg --output big-t512.png --tile 512 --tile-overlap 128
+# Side-by-side original | styled
+nf infer --input photo.jpg --comparison
 
-# Train with a composite head
-nf train --source-dir ... --target-dir ... --head lut3d+freqsplit --epochs 50
+# Tiled, for real high-frequency detail. Match --tile to --image-size.
+nf infer --input big.jpg --tile 256 --tile-overlap 64
+
+# Downscale the long edge, aspect preserved, then tile
+nf infer --input big.jpg --max-edge 1024 --tile 256
+
+# A whole folder, two stochastic variants each
+nf infer --input photos/ --seeds 2 --max-edge 1024
 ```
 
+`--tile` should equal the `image_size` the model was trained at. A mismatch is a
+distribution shift and the code warns about it. Measured cost on a 12 MP source:
+whole-frame sees 0.08× scale, tiling at 25% overlap processes ~22 MP. Use
+tiling for hero shots, not batches.
+
+Full reference in [`docs/INFERENCE.md`](docs/INFERENCE.md).
+
+### Training
+
 ```bash
-# Train
-nightflash-train --source-dir ... --target-dir ... --output-dir runs/hybrid
+# Two arms on two GPUs, in two notebook copies
+nf train --source-dir ... --target-dir ... --name a --arch edgehat --epochs 60
+nf train --source-dir ... --target-dir ... --name b --arch swinir  --epochs 60
 
-# Notebook / piped output: one clean line per update, no tqdm bar
---progress plain            # or: --progress tqdm | --progress none
+# Isolate a capability's effect
+nf train ... --no-halation
 
-# Continue the same architecture (--epochs is ABSOLUTE, not "extra epochs")
-nightflash-train ... --resume runs/hybrid/checkpoints/latest.pt --epochs 80
+# Kaggle: publish a Dataset version every epoch, so a disconnect costs 1 epoch
+nf train ... --epochs 60 --snapshot-every 1
 
 # Add the transformer to a trained conv-only model (carries conv weights,
 # randomises only the transformer, resets optimizer state)
@@ -197,22 +272,54 @@ python scripts/warm_start.py \
   --output-dir  runs/hybrid-warm
 
 # Change resolution on an existing checkpoint (safe at any size)
-nightflash-train ... --image-size 512 --batch-size 4 --resume runs/hybrid/checkpoints/latest.pt
+nightflash-train ... --image-size 512 --batch-size 4 \
+  --resume runs/hybrid/checkpoints/latest.pt
 ```
 
-See [`docs/WARM_START.md`](docs/WARM_START.md) for the full explanation of each.
+### Export
+
+```bash
+python -m nightflash.export_coreml \
+  --checkpoint runs/edgehat_freqsplit_night/checkpoints/latest.pt \
+  --output model.mlpackage --compute-units CPU_AND_GPU --half
+
+python -m nightflash.validate_coreml \
+  --checkpoint runs/edgehat_freqsplit_night/checkpoints/latest.pt \
+  --coreml model.mlpackage --input photo.jpg
+```
+
+Always run the validator. All 28 arch × head combinations have been verified to
+convert, with tensor-I/O MAE 0.00030 against PyTorch.
+
+### Inspecting a run
+
+```bash
+nf brief  --name night      # full plan + numbered decision menu
+nf state  --name night      # machine-readable JSON
+nf config --name night      # resolved config, no side effects
+```
+
+`nf reset --name night` archives to `nightflash_freqsplit_night_archive_N`; it
+never deletes without `--delete`.
+
+See [`docs/WARM_START.md`](docs/WARM_START.md) for resume and warm-start detail.
 
 ## Running on Google Colab and Kaggle
 
-Both notebooks are **six cells**, and cells 3 to 6 are byte-identical. Only the
-data plumbing differs.
+Both notebooks are **seven cells**: install, data, configuration, train,
+inspect, keep. Only the data plumbing and the snapshot lines differ.
 
-| Platform | Notebook | Data | Cross-session resume |
+| Platform | Notebook | Data | Cross-session survival |
 |---|---|---|---|
-| Colab | [`colab/NightFlash_Colab.ipynb`](colab/NightFlash_Colab.ipynb) | Google Drive | writes straight to Drive |
-| Kaggle | [`notebook/nightflash_kaggle.ipynb`](notebook/nightflash_kaggle.ipynb) | attached Dataset | `snapshot()` / `restore()` |
+| Colab | [`colab/NightFlash_Colab.ipynb`](colab/NightFlash_Colab.ipynb) | Google Drive | `runs_root` on Drive, nothing to snapshot |
+| Kaggle | [`notebook/nightflash_kaggle.ipynb`](notebook/nightflash_kaggle.ipynb) | attached Dataset | `snapshot_every=1` + `s.auto_resume()` |
 
-Package the code for upload (dataset and checkpoints are excluded):
+On Kaggle, `/kaggle/working` is wiped between sessions, so `snapshot_every=1`
+publishes a Dataset version after every epoch and `s.auto_resume()` restores the
+last one at the start of the next. Start with
+[`docs/QuickStartKaggle.md`](docs/QuickStartKaggle.md).
+
+Package the code for upload (datasets, runs and checkpoints are excluded):
 
 ```bash
 ./scripts/make_colab_bundle.sh     # → dist/nightflash-edge-colab.zip
@@ -220,37 +327,67 @@ Package the code for upload (dataset and checkpoints are excluded):
 
 The official Colab CLI (`pip install google-colab-cli`) and Colab MCP
 (`uvx git+https://github.com/googlecolab/colab-mcp`) are both documented in
-[`docs/COLAB.md`](docs/COLAB.md). Kaggle specifics, including the T4×2 tip, are in
-[`docs/KAGGLE.md`](docs/KAGGLE.md). The TUI does not run in either — use
+[`docs/COLAB.md`](docs/COLAB.md). The TUI does not run in either — use
 `nightflash-tui` on your Mac.
 
 ## Dataset status
 
 `training_photos/normal_photos/` and `validation_photos/` are populated by
 `scripts/scrape_dataset.py`, which pulls openly-licensed images from Openverse,
-screens them on measured pixel statistics, and records license and attribution in
+screens them on measured pixel statistics, and records licence and attribution in
 a `manifest.csv`.
 
-| Folder | Images | Status |
-| --- | ---: | --- |
-| `normal_photos/` | 1000 | Built — source domain |
-| `validation_photos/` | 20 | Built — held-out source images |
-| `disposable_photos/` | 45 | **Target domain, but unverified and too small** |
+| Folder | Images | `manifest.csv` | Status |
+| --- | ---: | --- | --- |
+| `normal_photos/` | 1000 | yes | Built — source domain |
+| `validation_photos/` | 20 | yes | Built — held-out source images |
+| `disposable_photos/` | 935 | **no** | **Not a usable target domain — see below** |
 
-> **⚠️ Open question on the target domain.** `docs/DATASET_SOURCING.md` and
-> `training_photos/disposable_photos/README.md` both state that this folder is
-> intentionally empty, because a calibration pass over 253 scraped images kept
-> only ~5–10% genuine night-flash snapshots and the rest were astronomy and macro
-> imagery. 45 image files are now present there, but no `manifest.csv` records
-> their provenance, and the folder README still describes it as empty.
->
-> Confirm those 45 images really are the Night Flash look before training on
-> them. A PatchGAN learns whatever distribution this folder contains, so if it is
-> the rejected scrape, the model will learn "black background with one bright
-> object" rather than the target aesthetic.
->
-> 45 images is also too few to avoid overfitting. See
-> [`docs/DATASET_SOURCING.md`](docs/DATASET_SOURCING.md).
+### ⚠️ The target domain is the blocker, not the model
+
+`disposable_photos/` is the only folder the model learns a look *from*, and it is
+not currently that look. Measured over all 935 images:
+
+| mean luminance | images | share | reads as |
+|---|---:|---:|---|
+| 0.00 – 0.10 | 19 | 2.0% | near-black, probably astronomy |
+| **0.10 – 0.20** | **68** | **7.3%** | **genuine night flash** |
+| 0.20 – 0.35 | 425 | 45.5% | dim indoor / dusk |
+| 0.35 – 0.50 | 307 | 32.8% | overcast daylight |
+| 0.50 – 1.00 | 116 | 12.4% | full daylight |
+
+Mean luminance is **0.350**, median **0.334**. Genuine night flash sits below
+0.20. So:
+
+- only **9.3%** (87 of 935) of the folder is in the target range;
+- **45.2%** (423 of 935) is above 0.35, i.e. daylit;
+- filenames are daylight travel and outdoor stock —
+  `young-woman-exploring-the-grand-palace-in-bangkok.jpg`,
+  `scenic-desert-road-along-colorado-river.jpg`;
+- median long edge is 579 px, and 27% are under 512 px.
+
+A PatchGAN learns whatever distribution this folder contains. Training on it
+teaches the **opposite** of Night Flash — a slightly hazy, desaturated daylight
+look — and no amount of epochs, architecture, or tiling will fix that.
+
+Two further gaps:
+
+- **No `manifest.csv`**, so licensing and attribution for those 935 images are
+  unrecorded. Resolve before anything ships.
+- **No held-out target set.** Without one, target-domain quality is
+  unmeasurable and you cannot tell progress from memorisation.
+
+The recommended fix is to **generate** the target set by running the app's
+existing deterministic `NightFlashProcessor` over `normal_photos/`. That gives
+unlimited correctly-labelled, correctly-licensed pairs-by-construction, and it
+converges far faster than scraping. See
+[`docs/DATASET_SOURCING.md`](docs/DATASET_SOURCING.md).
+
+You can re-run the measurement yourself before spending GPU hours — the snippet
+is in [`docs/QuickStartKaggle.md`](docs/QuickStartKaggle.md#before-you-start-the-target-domain).
+
+Note: `training_photos/disposable_photos/README.md` still describes the folder
+as intentionally empty. It is the user's file and has been left untouched.
 
 ## Important constraints
 

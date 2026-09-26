@@ -134,28 +134,60 @@ one, so no scraped target set is shipped.
 
 ## What will work
 
-Two options, in order of quality:
+### Current state of `disposable_photos/`
 
-**1. Real photographs (best).** Shoot or scan a disposable-camera roll at night.
-`docs/DATA.md` asks for exactly this, and 300–500 genuine frames will beat any
-scraped set. Drop them in as:
+935 images are present now, with **no `manifest.csv`**, so their provenance and
+licensing are unrecorded. Measured over all 935:
+
+| mean luminance | images | share | reads as |
+|---|---:|---:|---|
+| 0.00 – 0.10 | 19 | 2.0% | near-black, probably astronomy |
+| **0.10 – 0.20** | **68** | **7.3%** | **genuine night flash** |
+| 0.20 – 0.35 | 425 | 45.5% | dim indoor / dusk |
+| 0.35 – 0.50 | 307 | 32.8% | overcast daylight |
+| 0.50 – 1.00 | 116 | 12.4% | full daylight |
+
+Mean 0.350, median 0.334. Filenames are daylight travel and outdoor stock
+(`young-woman-exploring-the-grand-palace-in-bangkok.jpg`,
+`scenic-desert-road-along-colorado-river.jpg`). Median long edge 579 px, 27%
+under 512 px.
+
+So this folder is **not the rejected astronomy scrape described above, but it is
+not the target domain either** — it is mostly ordinary daylight photography with
+a dark cast. Only 9.3% of it is in the Night Flash range. Training on it teaches
+a slightly hazy, desaturated daylight look.
+
+The reproduction snippet is in [`DATA.md`](DATA.md#check-the-target-domain-before-you-train).
+Do not spend GPU hours on this folder as it stands.
+
+### Options, in order of quality
+
+**1. Generate the target set (recommended).** Run the app's existing
+deterministic `NightFlashProcessor` over `normal_photos/`. This is unlimited,
+correctly labelled by construction, carries no licensing question, and converges
+far faster than scraping because the domain gap is exactly the gap you designed.
+It also gives you a sanity baseline: a model trained on generated targets should
+at least approach the deterministic processor, and if it does not, the bug is in
+the model rather than the data.
 
 ```text
-training_photos/disposable_photos/
+training_photos/disposable_photos/     # regenerated, plus a manifest.csv
 ```
 
-Vary scene, subject, distance and flash intensity — a roll of near-identical
-flash portraits teaches a very narrow style. Then:
+**2. Real photographs.** Shoot or scan a disposable-camera roll at night.
+300–500 genuine frames will beat any scraped set. Vary scene, subject, distance
+and flash intensity — a roll of near-identical flash portraits teaches a very
+narrow style. Then screen it before training:
 
 ```bash
 python scripts/scrape_dataset.py --domain disposable --count 1000   # no-op/top-up guard
-nightflash-train \
+nf train \
   --source-dir training_photos/normal_photos \
   --target-dir training_photos/disposable_photos \
-  --output-dir runs/conv-baseline --image-size 256 --batch-size 8 --epochs 30
+  --name conv-baseline --image-size 256 --batch-size 8 --epochs 30
 ```
 
-**2. A free API key.** A Flickr API key enables *tag intersection*
+**3. A free API key.** A Flickr API key enables *tag intersection*
 (`toycamera` AND `night` AND `flash`), which is precisely the capability
 keyword search lacks, plus deep pagination well past the 240 cap. That is the
 only realistic way to approach this target domain from the web. An Openverse

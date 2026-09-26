@@ -41,7 +41,24 @@ A style model should preserve content even when the target domain has strong art
 
 ## Target-domain quality
 
-Use:
+You need a **held-out target set** — night-flash photographs the model never
+trained on. Without one, target-domain quality is unmeasurable and you cannot
+distinguish progress from memorisation. Keep it out of `target_dir`; the built-in
+diagnostics take a separate `--target-dir` for exactly this.
+
+```bash
+python -m nightflash.evaluate \
+  --checkpoint runs/edgehat_freqsplit_night/checkpoints/latest.pt \
+  --source-dir training_photos/normal_photos \
+  --target-dir training_photos/val_night \
+  --output-json runs/edgehat_freqsplit_night/evaluations/score.json
+```
+
+A note on `--val-dir`: `Session` accepts it, records it in `config.json` and
+prints it in the briefing, but the training loop does not consume it. Run
+`nightflash.evaluate` explicitly.
+
+Then use:
 
 - FID/KID against the target domain
 - LPIPS or DISTS against target references
@@ -51,6 +68,12 @@ Use:
 - Human pairwise preference
 
 FID alone does not tell you whether the model preserved the input scene.
+
+**Check the held-out set is actually the target domain** before trusting any of
+these numbers. FID between two distributions is low when both are *equally
+wrong* — it measures similarity, not correctness. The luminance check in
+[`DATA.md`](DATA.md#check-the-target-domain-before-you-train) applies to the
+held-out set too.
 
 ## Stochastic quality
 

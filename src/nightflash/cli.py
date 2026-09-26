@@ -51,6 +51,23 @@ def add_common(parser: argparse.ArgumentParser, *, need_data: bool = True) -> No
     parser.add_argument("--bottleneck-channels", type=int, default=None)
     parser.add_argument("--attention-heads", type=int, default=4)
     parser.add_argument("--region-grid", type=int, default=4)
+    parser.add_argument(
+        "--augment",
+        choices=("default", "conservative", "strong", "none"),
+        default="default",
+        help="augmentation preset; see docs/TRAINING.md",
+    )
+    parser.add_argument(
+        "--snapshot-every",
+        type=int,
+        default=0,
+        help="publish a Kaggle Dataset version every N epochs; 0 disables",
+    )
+    parser.add_argument(
+        "--snapshot-dataset",
+        default=None,
+        help="Kaggle dataset slug for snapshots; defaults to nightflash-<run>",
+    )
     if need_data:
         parser.add_argument("--source-dir", default=None)
         parser.add_argument("--target-dir", default=None)
@@ -85,6 +102,9 @@ def make_session(args: argparse.Namespace) -> Session:
         halation=args.halation,
         subject_gate=args.subject_gate,
         region_exposure=args.region_exposure,
+        augment_preset=args.augment,
+        snapshot_every=args.snapshot_every,
+        snapshot_dataset=args.snapshot_dataset,
         **overrides,
     )
 
@@ -123,10 +143,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="tile size in px for full-resolution inference; 0 (default) = whole frame",
     )
     infer_p.add_argument("--tile-overlap", type=int, default=128)
+    infer_p.add_argument(
+        "--pad-mode", choices=("edge", "reflect", "black"), default="edge",
+        help="what edge tiles see outside the frame",
+    )
+    infer_p.add_argument(
+        "--max-edge",
+        type=int,
+        default=0,
+        help="downscale the long edge to at most N px, aspect preserved; 0 = native",
+    )
 
     reset_p = sub.add_parser("reset", help="archive or wipe a run")
     add_common(reset_p, need_data=False)
     reset_p.add_argument("--delete", action="store_true", help="wipe in place, no archive")
+
+    snap_p = sub.add_parser("snapshot", help="publish the run as a Kaggle Dataset version")
+    add_common(snap_p, need_data=False)
+    snap_p.add_argument("--note", default=None)
+    snap_p.add_argument(
+        "--strict", action="store_true",
+        help="exit non-zero if the snapshot fails instead of warning",
+    )
+
+    resume_p = sub.add_parser("resume", help="restore an attached Kaggle snapshot if present")
+    add_common(resume_p, need_data=False)
+    resume_p.add_argument(
+        "--required", action="store_true",
+        help="fail instead of starting fresh when no snapshot is attached",
+    )
 
     return parser
 
@@ -166,7 +211,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "train":
-        plan = session.plan("plan", args.extra_epochs)
+        # Must ask in "train" mode: would_train is only set there.
+        plan = session.plan("train", args.extra_epochs)
         if not args.yes:
             print(brief(session, mode="train", extra_epochs=args.extra_epochs))
         if not plan["would_train"]:
@@ -184,9 +230,18 @@ def main(argv: list[str] | None = None) -> int:
             save_comparison=args.comparison,
             tile=args.tile,
             tile_overlap=args.tile_overlap,
+            pad_mode=args.pad_mode,
+            max_edge=args.max_edge,
         )
         print(f"wrote {len(written)} file(s) to {session.inference_dir}")
         return 0
+
+    if args.command == "snapshot":
+        info = session.snapshot(note=args.note, strict=args.strict)
+        return 0 if info is not None else 1
+
+    if args.command == "resume":
+        return 0 if session.auto_resume(required=args.required) else 1
 
     if args.command == "reset":
         destination = session.reset(archive=not args.delete)

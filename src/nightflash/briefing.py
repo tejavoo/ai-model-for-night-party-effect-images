@@ -136,12 +136,19 @@ def _flow_lines(session: Session, plan: dict[str, Any]) -> list[str]:
         lines.append("       per step: discriminator update, then generator update")
         lines.append("       losses  : PatchGAN + 1.5 content/edge + 0.35 moment "
                      "+ 0.75 identity + 0.02 effect")
+        lines.append(f"       augment : {session.augment.describe()}")
         step += 1
         lines.append(
             f"  {step}. every {session.preview_every} steps write a "
             "source | generated | target preview and a checkpoint"
         )
         step += 1
+        if session.snapshot_every > 0:
+            lines.append(
+                f"  {step}. every {session.snapshot_every} epoch(s) publish a Kaggle "
+                "Dataset version so a disconnect cannot lose the run"
+            )
+            step += 1
         lines.append(f"  {step}. write config.json and {session.checkpoint_dir}/latest.pt")
         step += 1
     else:
@@ -153,6 +160,7 @@ def _flow_lines(session: Session, plan: dict[str, Any]) -> list[str]:
     lines.append(
         f"       whole frame (default) or s.infer(..., tile=512) for native-resolution detail"
     )
+    lines.append("       match tile to image_size; add max_edge=N to downscale first")
     return lines
 
 

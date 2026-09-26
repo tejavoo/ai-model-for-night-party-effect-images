@@ -9,6 +9,8 @@ import torch
 from PIL import Image, ImageOps
 from torch.utils.data import DataLoader, Dataset
 
+from .augment import AugmentConfig, make_pair
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".heic"}
 
 
@@ -93,7 +95,12 @@ def _find_mask(mask_dir: Path | None, source_root: Path, source_path: Path) -> P
 
 
 class UnpairedImageDataset(Dataset[dict[str, Any]]):
-    """Source/target domain dataset that never requires aligned pairs."""
+    """Source/target domain dataset that never requires aligned pairs.
+
+    Geometry is sampled once per item and applied identically to the source, the
+    target and the mask, so the unpaired pair still describes a consistent crop
+    position. See ``augment.py`` for the rationale behind each knob.
+    """
 
     def __init__(
         self,
@@ -105,6 +112,7 @@ class UnpairedImageDataset(Dataset[dict[str, Any]]):
         seed: int = 0,
         randomize: bool = True,
         deterministic_target: bool = False,
+        augment: "AugmentConfig | None" = None,
     ) -> None:
         self.source_dir = Path(source_dir).expanduser().resolve()
         self.target_dir = Path(target_dir).expanduser().resolve()
@@ -115,6 +123,7 @@ class UnpairedImageDataset(Dataset[dict[str, Any]]):
         self.seed = int(seed)
         self.randomize = bool(randomize)
         self.deterministic_target = bool(deterministic_target)
+        self.augment = augment or AugmentConfig()
         self.epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
@@ -137,26 +146,29 @@ class UnpairedImageDataset(Dataset[dict[str, Any]]):
         rng = self._rng(index + 17_003)
         source = _load_rgb(source_path)
         target = _load_rgb(target_path)
-        source_resized = _resize_short(source, self.image_size)
-        source_crop = _choose_crop(source_resized, self.image_size, rng, self.randomize)
-        source = source_resized.crop(source_crop)
-        target, _ = _resize_and_crop(target, self.image_size, rng, self.randomize)
-
-        do_flip = self.randomize and rng.random() < 0.5
-        if do_flip:
-            source = ImageOps.mirror(source)
-            target = ImageOps.mirror(target)
-
-        mask = torch.zeros((1, self.image_size, self.image_size), dtype=torch.float32)
+        mask_image = None
         if self.mask_dir is not None:
             mask_path = _find_mask(self.mask_dir, self.source_dir, source_path)
             if mask_path is not None:
                 mask_image = _load_mask(mask_path)
-                mask_resized = _resize_short(mask_image, self.image_size, Image.Resampling.NEAREST)
-                mask_image = mask_resized.crop(source_crop)
-                if do_flip:
-                    mask_image = ImageOps.mirror(mask_image)
-                mask = _to_tensor(mask_image).mean(dim=0, keepdim=True)
+
+        if self.randomize:
+            # One shared geometric warp across source, target and mask.
+            source, target, mask_image = make_pair(
+                source, target, self.image_size, self.augment, rng, mask_image
+            )
+        else:
+            # Preview / evaluation path: deterministic centre crop, no jitter.
+            source = _resize_and_crop(source, self.image_size, rng, False)[0]
+            target = _resize_and_crop(target, self.image_size, rng, False)[0]
+            if mask_image is not None:
+                mask_image = _resize_and_crop(
+                    mask_image, self.image_size, rng, False, Image.Resampling.NEAREST
+                )[0]
+
+        mask = torch.zeros((1, self.image_size, self.image_size), dtype=torch.float32)
+        if mask_image is not None:
+            mask = _to_tensor(mask_image).mean(dim=0, keepdim=True)
 
         return {
             "source": _to_tensor(source),
@@ -176,6 +188,7 @@ def make_dataloaders(
     mask_dir: str | Path | None = None,
     num_workers: int = 2,
     seed: int = 0,
+    augment: "AugmentConfig | None" = None,
 ) -> tuple[DataLoader[dict[str, Any]], DataLoader[dict[str, Any]], UnpairedImageDataset]:
     train_dataset = UnpairedImageDataset(
         source_dir,
@@ -184,6 +197,7 @@ def make_dataloaders(
         mask_dir=mask_dir,
         seed=seed,
         randomize=True,
+        augment=augment,
     )
     preview_dataset = UnpairedImageDataset(
         source_dir,
@@ -193,6 +207,7 @@ def make_dataloaders(
         seed=seed + 1,
         randomize=False,
         deterministic_target=True,
+        augment=augment,
     )
     generator = torch.Generator().manual_seed(seed)
     train_loader = DataLoader(

@@ -198,6 +198,94 @@ If the deterministic result is good but stochastic results are bad, reduce:
 
 ## Training controls
 
+### Augmentation
+
+The loader samples one geometric warp per item and applies it **identically to
+the source, the target and the mask**. That last part is what keeps an unpaired
+dataset coherent: the two images come from different files, but both are
+cropped, scaled, rotated and flipped the same way, so the pair still describes a
+consistent crop position. If they diverged, the discriminator would see two
+different scenes and the content losses would pull in contradictory directions.
+
+Pick a preset:
+
+```bash
+--augment default        # scale 0.8-1.25, rot +/-12deg, hflip + vflip
+--augment conservative   # scale 0.9-1.15, rot +/-6deg,  hflip + vflip
+--augment strong         # wider scale, rot +/-15deg, + colour jitter + 2 holes
+--augment none           # deterministic centre crop, no jitter
+```
+
+Or in Python, for full control of the bounds:
+
+```python
+from nightflash.augment import AugmentConfig
+
+s = Session(..., augment=AugmentConfig(
+    scale_min=0.85, scale_max=1.2,     # how much of the scene fits the crop
+    rotate_degrees=8.0,               # cameras are rarely level
+    hflip=0.5, vflip=0.5,             # doubles the effective dataset
+    brightness=0.0, contrast=0.0,     # OFF by default; see below
+    saturation=0.0, temperature=0.0,
+    apply_colour_to_target=False,
+    holes=0, hole_size=0.12, hole_count_prob=0.0,
+))
+```
+
+The full rationale for each knob is in the `augment.py` module docstring. The
+short version:
+
+| knob | default | why |
+|---|---|---|
+| `scale_min/max` | 0.8 / 1.25 | **The one that matters most.** A 256px crop of a 12MP night photo is a close-up; the same crop of a 3MP wide shot is a whole room. Without jitter the model silently learns only the first case. |
+| `rotate_degrees` | 12 | Stops the model learning that a horizon is always horizontal. Kept small: past ~15° you are teaching it to accept tilted *content*. |
+| `hflip`, `vflip` | 0.5 each | Both are safe because neither domain has an inherent up direction. Diagonal flip is deliberately excluded — it would mirror real text and faces. |
+| colour jitter | **off** | See the trap below. |
+| `holes` (cutout) | **off** | Standard for classification because it forces context use. Less useful for *appearance* transfer, and it can teach the model to hallucinate texture over occluders — a bad trait for a camera filter. |
+
+#### The colour-jitter trap
+
+**Colour jitter is off by default, and that is deliberate.** Your target domain
+*is* a colour look. Perturbing target colour teaches the discriminator that the
+style is fuzzy, and it can wash out exactly the grade you are trying to learn.
+It is available behind `apply_colour_to_target=True` for when you have already
+memorised the target set, and it is included in the `strong` preset so you can
+measure what it does.
+
+Source-only colour jitter is safe and mildly useful, because the source domain
+genuinely varies in white balance.
+
+#### Consistency guarantees
+
+These are enforced and covered by tests, because violating any of them silently
+degrades training rather than raising:
+
+- every sample is exactly `image_size` × `image_size`, including a source
+  smaller than the crop (it is resampled up, never grey-padded — padding would
+  teach the model that a flat border is a normal input);
+- the mask is resampled with nearest-neighbour and filled with 0 at rotated
+  corners, so it stays binary and never invents a person;
+- the rotate fill colour is identical for source and target;
+- target colour jitter is off unless explicitly enabled.
+
+Keeping the crop at a fixed native resolution is also what lets you use the same
+number for `--tile` at inference.
+
+### Loss weights are `nightflash-train` only
+
+The subsections below tune the loss weights, and those flags live on the legacy
+standalone trainer:
+
+```bash
+nightflash-train --source-dir ... --target-dir ... --adversarial-weight 1.5
+```
+
+`nf train` and `Session` do **not** expose them, because the recommended path is
+the `Session` object and its fixed, tested loss balance. If you need to change a
+weight, either use `nightflash-train` or pass the config through
+`ModelConfig` — but be aware you are leaving the tested defaults, so re-verify
+the previews afterwards.
+
 ### More target realism
 
 Increase:

@@ -144,7 +144,7 @@ def run(args: argparse.Namespace) -> list[Path]:
 
         model_input = torch.cat([source, mask], dim=1) if use_mask else source
         with torch.no_grad():
-            residual, effect_params = model(model_input)
+            residual, effect_params, _ = run_generator(model, model_input)
         deterministic = torch.clamp(source + residual, 0.0, 1.0)
 
         # Undo the letterbox BEFORE effects so vignette/leak are evaluated on the

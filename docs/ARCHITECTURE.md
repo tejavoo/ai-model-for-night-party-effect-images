@@ -95,6 +95,14 @@ cell's coefficients are conditioned on that cell's own features. Flattening the
 grid into one large linear layer would couple every cell to every other and cost
 far more parameters for a worse result.
 
+### Tiled inference interacts with region exposure
+
+Region exposure conditions each cell on that cell's own features, which assumes
+the grid spans the photograph. Under tiling the grid spans a *tile*, so the
+semantics change silently. `Session.infer` prints a note when it detects
+`tile > 0` together with `region_exposure`; either infer whole-frame or train
+with `--no-region-exposure`.
+
 ---
 
 ## Output heads
@@ -106,7 +114,7 @@ The head decides what the network is even allowed to do.
 | `tanh` | bounded delta (±`residual_scale`) | 21 k | safest with little data, but feels like a global filter |
 | `perpixel` | unbounded delta, clamped on read | 42 k | free to repaint pixels, not just shift colour |
 | `freqsplit` | low / mid / high bands separately | 63 k | routes grain and halation into the high band |
-| `lut3d` | 33³ colour LUT **+ per-pixel conv** | 129 k | global grade *and* local detail in one head |
+| `lut3d` | 33³ trilinear colour LUT **+ per-pixel delta** | 129 k | global grade *and* local detail in one head |
 
 `freqsplit` uses a fixed 3-tap blur and its complement as band separators, so the
 head stays a plain convolutional network while each frequency band still gets its
@@ -230,6 +238,51 @@ Unpaired, so the objective is adversarial plus constraints:
 
 The discriminator is the only loss that sees targets as targets. Everything else
 is a leash.
+
+These weights are fixed and are not exposed on `nf` / `Session`. `nightflash-train`
+has flags for them if you need to experiment; see
+[`TRAINING.md`](TRAINING.md#loss-weights-are-nightflash-train-only).
+
+---
+
+## Data pipeline
+
+`src/nightflash/data.py` and `src/nightflash/augment.py`. The loader is unpaired:
+each item pairs a source image with a *randomly chosen* target image, and the
+network never sees them as a correspondence.
+
+### One warp, three images
+
+The most important property: a single set of geometric parameters is sampled per
+item and applied to the **source, the target, and the person mask** alike.
+
+```text
+params = {scale, degrees, hflip, vflip}      # sampled once
+
+source -> resize+scale -> crop -> rotate -> flip  \
+target -> resize+scale -> crop -> rotate -> flip   >  same params
+mask   -> resize+scale -> crop -> rotate -> flip  /   (nearest-neighbour, fill 0)
+```
+
+This is not a detail. With unpaired sampling the two images come from different
+files, so nothing forces their crops to correspond. Applying different warps
+would hand the discriminator two unrelated scenes and pull the content losses in
+contradictory directions — a silent, plausible-looking degradation with no error.
+
+### Guarantees
+
+- every sample is exactly `image_size`², including a source smaller than the
+  crop (resampled **up**, never grey-padded — padding would teach the model that
+  a flat border is a normal input);
+- the mask uses nearest-neighbour and a 0 fill, so it stays binary and a rotated
+  corner cannot invent a person;
+- the rotate fill colour is identical for source and target;
+- target colour jitter is off unless explicitly enabled — the target carries the
+  style signal, and perturbing it teaches a fuzzy look.
+
+Keeping every sample at a fixed native crop resolution is also what lets the same
+number be used for `--tile` at inference. Knob-by-knob rationale and the presets
+are in [`TRAINING.md`](TRAINING.md#augmentation).
 
 ---
 

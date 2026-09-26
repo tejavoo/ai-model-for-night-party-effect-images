@@ -2,17 +2,27 @@
 
 Google Colab is suitable for training this compact model. It is **not** a good place to run the interactive TUI, because Colab notebooks do not provide a persistent terminal UI.
 
+The Kaggle quickstart ([`QuickStartKaggle.md`](QuickStartKaggle.md)) covers the
+whole flow end to end, including both-GPU setup and the command cookbook. This
+document is Colab-specific: paths, Drive persistence, the Colab CLI, and the
+Colab MCP.
+
 ---
 
 ## Choose your path
 
-There are three supported ways to drive Colab. All of them end up running the exact same `nightflash-train` command.
+There are three supported ways to drive Colab. All of them end up running the
+same training code; path A drives it through a `Session` object, paths B and C
+through the `nf` command or the legacy `nightflash-train`.
 
 | Path | Use when | Docs |
 |---|---|---|
 | **A. Notebook** (recommended) | You want to watch training, inspect previews inline, iterate interactively | [`colab/NightFlash_Colab.ipynb`](../colab/NightFlash_Colab.ipynb) |
 | **B. Colab CLI** | You want to script it from your Mac terminal, or run unattended overnight jobs | [Colab CLI](#colab-cli-terminal-workflow) below |
 | **C. Colab MCP** | You want your coding agent to drive the Colab session for you | [Colab MCP](#colab-mcp-agent-workflow) below |
+
+The notebook is **seven cells**: install, data, configuration, train, inspect,
+keep. Only cell 3 needs editing.
 
 Do not use the TUI in Colab. Use `nightflash-tui` on your Mac instead.
 
@@ -33,18 +43,30 @@ MyDrive/nightflash-edge/
 | Domain | Count | Status |
 |---|---:|---|
 | `normal_photos` (source) | 1000 | fine |
-| `disposable_photos` (target) | 45 | **too few — will overfit** |
+| `disposable_photos` (target) | 935 | **wrong domain, not just small — see below** |
 | `validation_photos` (source) | 20 | fine |
 | held-out target | 0 | **target quality is unmeasurable** |
 
-This is enough to prove the pipeline runs end to end. It is not enough to judge model quality: a PatchGAN will memorise 45 images within a couple of epochs, so training-target statistics become meaningless as a quality signal.
+This is enough to prove the pipeline runs end to end. It is not enough to judge
+model quality.
 
-Before treating results as real, either:
+The target folder has 935 images but they are not night-flash photographs.
+Measured mean luminance is 0.350 (genuine night flash is below 0.20); only 9.3%
+of the folder is in the target range and 45.2% is daylit above 0.35. There is
+also no `manifest.csv`, so licensing is unrecorded.
 
-- grow the target set — `python scripts/scrape_dataset.py --domain disposable --count 1000`, then re-run the aesthetic screening described in [`DATASET_SOURCING.md`](DATASET_SOURCING.md); or
-- hold out ~15 target images and point `--target-dir` at them when evaluating.
+A PatchGAN learns whatever distribution the target folder contains, so training
+on this teaches a slightly hazy daylight look rather than Night Flash. Fix the
+folder before drawing any conclusion from the run — see
+[`DATASET_SOURCING.md`](DATASET_SOURCING.md) and
+[`QuickStartKaggle.md`](QuickStartKaggle.md#before-you-start-the-target-domain)
+for a copy-pasteable measurement you can run first.
 
-See [`DATASET_SOURCING.md`](DATASET_SOURCING.md) for how the dataset was built and its licensing obligations.
+Also hold out ~15 target images and point `--target-dir` at them when
+evaluating, otherwise target quality stays unmeasurable.
+
+See [`DATASET_SOURCING.md`](DATASET_SOURCING.md) for how the dataset was built
+and its licensing obligations.
 
 ---
 
@@ -521,25 +543,65 @@ The Drive-mount cell in the notebook may block under `colab exec` because Google
 
 ## Tiled inference on Colab
 
-A 256px model letterboxes a 12-megapixel phone photo to roughly 0.06× scale.
+A 256px model letterboxes a 12-megapixel phone photo to roughly 0.08× scale.
 Nothing is cropped or stretched, but high-frequency detail is lost — and detail is
 what the halation and `freqsplit` heads exist to produce.
 
 ```python
 s.infer(photo_path)                    # whole frame
-s.infer(photo_path, tile=512)          # near-native resolution, crossfaded
-s.infer(photo_path, tile=512, tile_overlap=256)   # smoother, more cost
+s.infer(photo_path, tile=256)          # near-native resolution, crossfaded
+s.infer(photo_path, tile=256, tile_overlap=128)   # smoother, ~2x the cost
+s.infer(photo_path, max_edge=1024)     # downscale first, aspect preserved
+s.infer(photo_path, max_edge=1024, tile=256)      # downscale AND tile
 ```
 
-| frame | tile 512 / overlap 128 | tiles | MP processed |
-|---|---:|---:|---:|
-| 1920×1080 | 512 | 15 | 3.9 |
-| 4032×3024 | 512 | 88 | 23.1 |
+**Match `tile` to the `image_size` you trained at.** A model trained on 256px
+crops has learned 256px-crop feature statistics; a different tile size is a
+distribution shift, and `Session.infer` warns when they differ.
+
+Measured cost on a 4032×3024 source:
+
+| tile | overlap ratio | tiles | MP processed |
+|---:|---:|---:|---:|
+| 256 | 25% | 336 | 22.0 |
+| 256 | 50% | 713 | 46.7 |
+| 512 | 25% | 88 | 23.1 |
+
+What matters is the overlap **ratio**, not its absolute size. Use 25% for speed
+on a batch, 50% when quality matters.
+
+Borders do not fade to black: the Hann window has a positive floor and edge tiles
+are padded, so the frame border is never a tile border. A 255-valued border strip
+survives at 254.6/255. `pad_mode="reflect"` is available if the default
+edge-replication is visible on strong vertical structure.
 
 Use the whole-frame path for bulk work and tiling for final images. Tiled
 inference makes `region-exposure` **tile-local**, so train with
 `--no-region-exposure` if you need global regions. Full detail in
 [`INFERENCE.md`](INFERENCE.md#tiled-inference--optional-for-real-detail).
+
+## Augmentation on Colab
+
+Set it once in cell 3:
+
+```python
+s = Session(..., augment_preset="default")
+```
+
+| preset | scale | rotation | flips | colour jitter | holes |
+|---|---|---|---|---|---|
+| `default` | 0.8–1.25 | ±12° | h + v | off | off |
+| `conservative` | 0.9–1.15 | ±6° | h + v | off | off |
+| `strong` | 0.7–1.4 | ±15° | h + v | ±0.1 | 2 |
+| `none` | — | — | — | off | off |
+
+One geometric warp per item, applied **identically to the source, the target and
+the mask**, so an unpaired batch still describes a consistent crop position.
+
+Colour jitter is off by default on purpose: the target domain *is* a colour look,
+and perturbing it teaches the discriminator the style is fuzzy. `strong`
+includes it so you can measure what it does. Full rationale in
+[`TRAINING.md`](TRAINING.md#augmentation).
 
 ## Choosing a head
 
@@ -547,7 +609,7 @@ inference makes `region-exposure` **tile-local**, so train with
 
 ```python
 s = Session(head="freqsplit",      ...)   # default: low / mid / high bands
-s = Session(head="lut3d",           ...)   # global LUT + per-pixel conv
+s = Session(head="lut3d",           ...)   # global trilinear LUT + per-pixel delta
 s = Session(head="lut3d+freqsplit", ...)   # best default: global + band detail
 s = Session(head="tanh+freqsplit",  ...)   # band detail, fully bounded
 ```
@@ -555,6 +617,22 @@ s = Session(head="tanh+freqsplit",  ...)   # band detail, fully bounded
 `lut3d+freqsplit` is the most useful composite because the two parts do
 genuinely different things: a global colour grade and local per-band detail.
 Parameter costs are in [`ARCHITECTURE.md`](ARCHITECTURE.md#output-heads).
+
+## Persistence on Colab
+
+Colab Drive survives a disconnect, so there is nothing to snapshot. Point
+`runs_root` at Drive and leave `snapshot_every` at 0:
+
+```python
+s = Session(..., runs_root="/content/drive/MyDrive/nightflash/runs",
+            device="cuda", snapshot_every=0)
+s.auto_resume()      # reports "not a Kaggle runtime" and does nothing
+```
+
+The same notebook cell is safe to run in either environment. Colab does
+disconnect idle sessions after ~90 minutes, so a shorter `extra_epochs` per run
+gives you more save points. To move a finished run to Kaggle, zip the run
+directory and upload it as a Dataset — `s.auto_resume()` there picks it up.
 
 ## Useful commands
 

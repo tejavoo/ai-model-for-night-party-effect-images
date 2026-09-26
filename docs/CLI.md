@@ -133,13 +133,26 @@ nf state                                # machine-readable state JSON
 nf config                               # resolved config JSON
 nf train      [--extra-epochs N] [--yes]
 nf infer      --input PATH [--seeds N] [--comparison]
-              [--tile N] [--tile-overlap N]
+              [--tile N] [--tile-overlap N] [--pad-mode edge|reflect|black]
+              [--max-edge N]
 nf reset      [--delete]
+nf snapshot   [--note TEXT] [--strict] # publish a Kaggle Dataset version
+nf resume     [--required]             # restore an attached snapshot
 ```
+
+`nf state`, `nf config`, `nf reset`, `nf snapshot` and `nf resume` take no data
+paths — they read the run directory only.
 
 `--tile 0` (default) processes the whole frame. `--tile 512` processes
 overlapping 512px tiles and crossfades them, so the model works near native
 resolution. Outputs are written as `<stem>-t512.png` so both are kept.
+
+`--max-edge N` downscales the long edge to at most N pixels, **preserving aspect
+ratio**, before anything else. It never upscales. Combined with `--tile` it
+gives you downscale-then-tile, which is usually what you want for batching.
+
+`--pad-mode` chooses what an edge tile sees outside the frame: `edge` (default,
+replicate), `reflect` (mirror), `black` (zero fill).
 
 Every command takes the same run flags, so they all address the same run:
 
@@ -157,16 +170,25 @@ Every command takes the same run flags, so they all address the same run:
 --num-workers 2
 --preview-every 250
 --log-every 25
+--effects-strength 0.5
 --halation / --no-halation
 --subject-gate / --no-subject-gate
 --region-exposure / --no-region-exposure
 --bottleneck-channels N
 --attention-heads N
 --region-grid N
+--augment default|conservative|strong|none
+--snapshot-every N
+--snapshot-dataset SLUG
 ```
 
 Training additionally takes `--source-dir`, `--target-dir`, `--val-dir`,
 `--mask-dir`.
+
+`--snapshot-every N` publishes a Kaggle Dataset version every N epochs. It is
+off by default (`0`) and never fails training — a snapshot error prints a
+warning and the run continues, because losing an hour of training to a network
+error would be a bad trade.
 
 Examples:
 

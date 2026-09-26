@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageOps
 
+from .arch import run_generator
 from .data import list_images
 from .effects import apply_stochastic_effects
 from .losses import edge_loss
@@ -103,7 +104,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             else:
                 mask = None
                 model_input = source
-            residual, effect_params = model(model_input)
+            # New architectures return a 3-tuple; run_generator normalises both
+            # the 2-tuple and 3-tuple shapes so this stays arch-agnostic.
+            residual, effect_params, _ = run_generator(model, model_input)
             deterministic = torch.clamp(source + residual, 0.0, 1.0)
             styled = (
                 deterministic

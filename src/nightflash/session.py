@@ -34,6 +34,7 @@ import torch
 from torch import Tensor, nn
 
 from .arch import ARCHITECTURES, HEADS, build_generator, new_arch_config, run_generator
+from .augment import AugmentConfig
 from .config import ModelConfig
 from .data import UnpairedImageDataset, make_dataloaders
 from .effects import apply_stochastic_effects
@@ -52,6 +53,22 @@ from .utils import ensure_dir, resolve_device, save_json, save_preview, seed_eve
 Mode = Literal["plan", "train", "infer"]
 
 SUBDIRS = ("checkpoints", "previews", "inferences", "evaluations", "logs")
+
+AUGMENT_PRESETS = ("default", "conservative", "strong", "none")
+
+
+def _augment_from_preset(preset: str) -> AugmentConfig:
+    if preset == "conservative":
+        return AugmentConfig.conservative()
+    if preset == "strong":
+        return AugmentConfig.strong()
+    if preset == "none":
+        return AugmentConfig(
+            scale_min=1.0, scale_max=1.0, rotate_degrees=0.0, hflip=0.0, vflip=0.0
+        )
+    if preset != "default":
+        raise ValueError(f"augment_preset must be one of {AUGMENT_PRESETS}, got {preset!r}")
+    return AugmentConfig()
 
 
 def slugify(text: str) -> str:
@@ -138,6 +155,10 @@ class Session:
         subject_gate: bool = True,
         region_exposure: bool = True,
         resume: bool = True,
+        augment: "AugmentConfig | None" = None,
+        augment_preset: str = "default",
+        snapshot_every: int = 0,
+        snapshot_dataset: str | None = None,
         **arch_overrides: Any,
     ) -> None:
         if arch not in ARCHITECTURES:
@@ -169,6 +190,9 @@ class Session:
         self.log_every = log_every
         self.effects_strength = effects_strength
         self.resume_enabled = resume
+        self.augment = augment or _augment_from_preset(augment_preset)
+        self.snapshot_every = int(snapshot_every)
+        self.snapshot_dataset = snapshot_dataset
 
         folder = f"{arch}_{head}{'_' + name if name else ''}"
         self.run_dir = Path(runs_root) / folder
@@ -196,6 +220,60 @@ class Session:
     @property
     def log_path(self) -> Path:
         return self.run_dir / "logs" / "train.log"
+
+    # ------------------------------------------------------------- kaggle glue
+
+    def auto_resume(self, *, required: bool = False) -> bool:
+        """Pull in an attached Kaggle snapshot if one exists for this run.
+
+        Call this at the top of every new Kaggle session instead of importing
+        :func:`nightflash.kaggle.restore` by hand. Returns ``True`` when a
+        snapshot was restored, ``False`` when you are starting fresh.
+
+        Outside Kaggle it is a no-op that reports why, so the same notebook cell
+        is safe in Colab.
+        """
+
+        from .kaggle import auto_restore, is_kaggle
+
+        if not is_kaggle():
+            print("not a Kaggle runtime; nothing to restore")
+            return False
+        restored = auto_restore(self.run_dir, required=required)
+        if restored is not None:
+            print(f"resumed {restored.name} at epoch {self.state().last_epoch + 1}")
+            return True
+        return False
+
+    def snapshot(
+        self, *, note: str | None = None, strict: bool = False
+    ) -> "object | None":
+        """Publish the run as a Kaggle Dataset version. No-op off Kaggle.
+
+        Failures are reported and swallowed by default, because this is the
+        call you make in the last cell before a session ends: a missing
+        ``kaggle`` package or an expired token should print a warning, not lose
+        the run you were trying to save. Pass ``strict=True`` to raise instead.
+        """
+
+        from .kaggle import is_kaggle, snapshot as _snapshot
+
+        if not is_kaggle():
+            print("not a Kaggle runtime; skip snapshot (use Colab Drive instead)")
+            return None
+        try:
+            info = _snapshot(self.run_dir, dataset=self.snapshot_dataset, note=note)
+        except Exception as exc:
+            if strict:
+                raise
+            print(
+                f"snapshot failed ({type(exc).__name__}: {exc}).\n"
+                f"         The run is still on disk at {self.run_dir}. Save Version "
+                "with output enabled, or download it before the session ends."
+            )
+            return None
+        print(f"snapshot -> {info.dataset} v{info.version}")
+        return info
 
     # ------------------------------------------------------------------ state
 
@@ -245,14 +323,22 @@ class Session:
     def target_epoch(self, extra_epochs: int | None = None) -> int:
         """Absolute epoch to train to.
 
-        ``--epochs`` style semantics: this returns ``last_epoch + 1 + extra``, so
-        a resume can never land on an empty loop and silently train nothing.
+        Two different intents, and mixing them up is how a run silently trains
+        forever:
+
+        * ``extra_epochs`` given -> **relative**. ``train(extra_epochs=20)`` on a
+          run at epoch 30 stops at epoch 50. This is the resume path, and it is
+          why a resume can never land on an empty loop and train nothing.
+        * ``extra_epochs`` omitted -> **absolute**. ``--epochs 50`` means "epoch
+          50", so running it again at epoch 50 is a no-op rather than another
+          50 epochs.
         """
 
-        state = self.state()
-        start = 0 if state.last_epoch is None else state.last_epoch + 1
-        extra = self.epochs if extra_epochs is None else extra_epochs
-        return start + extra
+        if extra_epochs is not None:
+            state = self.state()
+            start = 0 if state.last_epoch is None else state.last_epoch + 1
+            return start + int(extra_epochs)
+        return int(self.epochs)
 
     # ------------------------------------------------------------------ plan
 
@@ -366,6 +452,7 @@ class Session:
             self.source_dir, self.target_dir,
             image_size=self.image_size, batch_size=self.batch_size,
             mask_dir=self.mask_dir, num_workers=self.num_workers, seed=self.seed,
+            augment=self.augment,
         )
         if len(train_loader) == 0:
             raise ValueError("empty DataLoader; reduce --batch-size or add images")
@@ -444,8 +531,33 @@ class Session:
             )
             self._save(model, discriminator, optimizer_g, optimizer_d, epoch, global_step)
             self._preview(model, preview_loader, device, epoch, global_step, use_mask, name=f"epoch-{epoch+1:04d}")
+            if self.snapshot_every > 0 and (epoch + 1) % self.snapshot_every == 0:
+                self._maybe_snapshot(epoch + 1)
 
         return {**info, "completed": True, "global_step": global_step}
+
+    def _maybe_snapshot(self, epoch: int) -> None:
+        """Publish the run as a Kaggle Dataset version, never failing the run.
+
+        A snapshot is a convenience, not a correctness requirement, so any error
+        is downgraded to a warning: losing network access mid-session must not
+        destroy an hour of training.
+        """
+
+        from .kaggle import is_kaggle, snapshot
+
+        if not is_kaggle():
+            print("snapshot requested but this is not a Kaggle runtime; skipping")
+            return
+        try:
+            info = snapshot(
+                self.run_dir,
+                dataset=self.snapshot_dataset,
+                note=f"epoch {epoch}",
+            )
+            print(f"epoch {epoch}: snapshot -> {info.dataset} v{info.version}")
+        except Exception as exc:
+            print(f"epoch {epoch}: snapshot failed ({exc}); training continues")
 
     # ------------------------------------------------------------------ infer
 
@@ -470,15 +582,29 @@ class Session:
         device: str | None = None,
         tile: int = 0,
         tile_overlap: int = 128,
+        pad_mode: str = "edge",
+        max_edge: int = 0,
     ) -> list[Path]:
         """Run inference only. Never touches the training loop.
 
-        ``tile=0`` (default) processes the whole frame: nothing is cropped or
-        stretched, but the model sees the image downscaled to ``image_size``.
+        Parameters
+        ----------
+        tile:
+            ``0`` (default) processes the whole frame: nothing is cropped or
+            stretched, but the model sees the image downscaled to ``image_size``.
+            A positive value processes overlapping tiles of that size.
+        tile_overlap:
+            Overlap in pixels. 25% of the tile is the usual starting point.
+        pad_mode:
+            What the model sees outside the frame for edge tiles.
+        max_edge:
+            Downscale the long edge to at most this many pixels, **preserving
+            aspect ratio**, before any other processing. ``0`` disables it.
+            Useful for batching or for a model trained at a small ``image_size``.
 
-        ``tile=512`` processes overlapping 512px tiles and crossfades them, so the
-        model works near native resolution. Costs proportionally more compute and
-        makes ``region-exposure`` tile-local. See ``docs/INFERENCE.md``.
+        ``tile`` should match the ``image_size`` the model was trained at. A
+        mismatch is warned about rather than blocked, because running a large
+        tile through a small-crop model is occasionally useful.
         """
 
         from PIL import Image, ImageOps
@@ -491,6 +617,13 @@ class Session:
         written: list[Path] = []
         fit = "letterbox"
 
+        if tile and tile != self.image_size:
+            print(
+                f"warning: tile={tile} but this model was trained at image_size={self.image_size}.\n"
+                f"         Matching them is the reliable choice: a small tile gives the\n"
+                f"         network a smaller context than it trained on, a large tile puts\n"
+                f"         its receptive field in a different regime."
+            )
         if tile and self.config.use_region_exposure:
             print(
                 "note: tiled inference makes region-exposure tile-local. "
@@ -517,6 +650,19 @@ class Session:
         with torch.no_grad():
             for path in paths:
                 image = ImageOps.exif_transpose(Image.open(path).convert("RGB"))
+                original_size = image.size
+                if max_edge and max(image.size) > max_edge:
+                    scale = max_edge / max(image.size)
+                    image = image.resize(
+                        (max(1, round(image.width * scale)),
+                         max(1, round(image.height * scale))),
+                        Image.Resampling.LANCZOS,
+                    )
+                    print(
+                        f"{path.name}: downscaled {original_size} -> {image.size} "
+                        f"(long edge {max_edge}, aspect preserved)"
+                    )
+
                 for seed_index in range(seeds):
                     if tile:
                         count = tile_count(image.width, image.height, tile, tile_overlap)
@@ -530,13 +676,16 @@ class Session:
                             return run_frame(piece, seed_index)
 
                         out = apply_tiled(
-                            image, process, tile_size=tile, overlap=tile_overlap
+                            image, process, tile_size=tile,
+                            overlap=tile_overlap, pad_mode=pad_mode,
                         )
                     else:
                         out = run_frame(image, seed_index)
 
                     suffix = "" if seeds == 1 else f"-seed{seed_index}"
                     mode = "" if not tile else f"-t{tile}"
+                    if max_edge:
+                        mode += f"-m{max_edge}"
                     destination = self.inference_dir / f"{path.stem}{mode}{suffix}.png"
                     if save_comparison:
                         canvas = Image.new("RGB", (image.width * 2, image.height))
@@ -546,7 +695,7 @@ class Session:
                     else:
                         out.save(destination)
                     written.append(destination)
-                    print(f"{path.name} -> {destination.name}")
+                    print(f"{path.name} -> {destination.name}  {out.size}")
         return written
 
     # ----------------------------------------------------------------- helpers

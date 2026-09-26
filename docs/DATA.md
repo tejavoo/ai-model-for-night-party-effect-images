@@ -64,6 +64,52 @@ Avoid:
 - Images all from one person or location
 - Scans with scanner color casts that you do not want
 
+### Check the target domain before you train
+
+This is the single most common way to waste GPU hours. A PatchGAN learns whatever
+distribution the target folder contains, so a wrong folder does not fail — it
+quietly teaches the wrong look.
+
+For a Night Flash target, **mean luminance should be below 0.20**. Daylit
+photography sits above 0.35. Measure before training:
+
+```python
+import numpy as np
+from pathlib import Path
+from PIL import Image
+
+lums, sizes = [], []
+for p in sorted(Path("target").glob("*")):
+    if p.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".heic"}:
+        continue
+    im = Image.open(p).convert("L")
+    lums.append(np.asarray(im, np.float32).mean() / 255.0)
+    sizes.append(max(im.size))
+
+lums, sizes = np.array(lums), np.array(sizes)
+print(f"images            {len(lums)}")
+print(f"mean luminance    {lums.mean():.3f}  (night flash: < 0.20)")
+print(f"under 0.20        {(lums < 0.20).mean():.0%}")
+print(f"over 0.35         {(lums > 0.35).mean():.0%}   (want: very few)")
+print(f"median long edge  {np.median(sizes):.0f}px  (want: >= 512)")
+```
+
+If `over 0.35` is high, the folder holds daylight photos and no amount of
+training will fix it. If the median long edge is under 512, the target is also
+too small to carry grain and halation detail.
+
+The current state of `training_photos/disposable_photos/` fails this check — see
+the dataset status table in [`../README.md`](../README.md#dataset-status) and
+[`DATASET_SOURCING.md`](DATASET_SOURCING.md).
+
+### Generating the target set instead
+
+If you cannot source enough genuine photographs, generate them by running the
+app's existing deterministic processor over the source domain. That gives
+unlimited, correctly-labelled, correctly-licenced targets by construction, and it
+converges much faster than scraping. See
+[`DATASET_SOURCING.md`](DATASET_SOURCING.md#what-will-work).
+
 ## No paired images
 
 The training code does not require:
@@ -75,6 +121,12 @@ source[i] ↔ target[i]
 For every source image, the loader samples a random target image. The discriminator learns the target-domain distribution, while content/identity losses constrain the source-to-output relationship.
 
 This is unpaired domain translation, not paired regression.
+
+One consequence worth knowing: because the two images are unrelated, the loader
+applies a **single shared geometric warp** to the source, the target and the
+mask each time. If they were warped independently the discriminator would see two
+different scenes and the content losses would contradict each other. See
+[`ARCHITECTURE.md`](ARCHITECTURE.md#data-pipeline).
 
 ## Train/validation split
 
