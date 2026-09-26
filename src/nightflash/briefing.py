@@ -114,6 +114,14 @@ def _flow_lines(session: Session, plan: dict[str, Any]) -> list[str]:
         lines.append(f"       masks  : {session.mask_dir}")
     else:
         lines.append("       masks  : none (subject gate will learn from appearance)")
+    if session.train_mode != "unpaired":
+        lines.append(f"       mode   : {session.train_mode} — the source is synthesised by "
+                     f"degrading images from the target pool")
+        lines.append(f"       degrade: {session.degrade.describe()}")
+        curriculum = "ramping subtle -> moderate -> strong" \
+            if session.degrade.curriculum else "fixed"
+        lines.append(f"                curriculum {curriculum}; identity path "
+                     f"p={session.degrade.none_prob:.2f}")
     step += 1
 
     if plan["would_train"]:
@@ -136,6 +144,9 @@ def _flow_lines(session: Session, plan: dict[str, Any]) -> list[str]:
         lines.append("       per step: discriminator update, then generator update")
         lines.append("       losses  : PatchGAN + 1.5 content/edge + 0.35 moment "
                      "+ 0.75 identity + 0.02 effect")
+        if session.paired_weight > 0.0:
+            lines.append(f"                + {session.paired_weight} paired reconstruction "
+                         "(supervised, deterministic output)")
         lines.append(f"       augment : {session.augment.describe()}")
         step += 1
         lines.append(
@@ -143,6 +154,20 @@ def _flow_lines(session: Session, plan: dict[str, Any]) -> list[str]:
             "source | generated | target preview and a checkpoint"
         )
         step += 1
+        if session.train_mode != "unpaired" and session.val_config["every"] > 0:
+            lines.append(
+                f"  {step}. every {session.val_config['every']} epoch(s) score a held-out "
+                f"split and write runs/validations/epoch-XXXX.png "
+                f"({session.val_config['count']} images, {session.val_config['select']})"
+            )
+            lines.append(f"       cells  : input | output | target, one image per row")
+            if session.keep_best and session.train_mode == "paired":
+                lines.append("       keep   : best.pt on a validation PSNR improvement; "
+                             f"{session.keep_last} recent epoch checkpoints")
+            elif session.train_mode == "sameset":
+                lines.append("       note   : no best.pt — sameset has no correspondence, "
+                             "so PSNR ranks nothing")
+            step += 1
         if session.snapshot_every > 0:
             lines.append(
                 f"  {step}. every {session.snapshot_every} epoch(s) publish a Kaggle "
