@@ -24,6 +24,7 @@ coreml = ["coremltools>=8.0"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]
+nf = "nightflash.cli:main"
 nightflash-train = "nightflash.train:main"
 nightflash-infer = "nightflash.infer:main"
 nightflash-evaluate = "nightflash.evaluate:main"

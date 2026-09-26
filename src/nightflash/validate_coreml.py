@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageOps
 
+from .arch import run_generator
 from .utils import load_model_checkpoint, resolve_device
 
 
@@ -66,7 +67,7 @@ def run(args: argparse.Namespace) -> dict[str, float]:
     if model.config.use_mask:
         raise ValueError("Core ML validation currently supports checkpoints without a mask input")
     with torch.no_grad():
-        residual, _ = model(source)
+        residual, _, _ = run_generator(model, source)
         pytorch_output = torch.clamp(source + residual, 0.0, 1.0)[0].cpu().permute(1, 2, 0).numpy()
 
     coreml_output = _predict_coreml(Path(args.coreml), source, source_image)

@@ -7,6 +7,8 @@ import threading
 import webbrowser
 from pathlib import Path
 
+from .streaming import iter_output
+
 try:
     from textual.app import App, ComposeResult
     from textual.containers import Horizontal, Vertical
@@ -79,6 +81,9 @@ class NightFlashTUI(App):  # type: ignore[misc]
                     yield Label("Device")
                     yield Input(value="auto", id="device")
                 with Horizontal(classes="field"):
+                    yield Label("Resume checkpoint")
+                    yield Input(value="", placeholder="optional: path/to/latest.pt", id="resume")
+                with Horizontal(classes="field"):
                     yield Label("Edge transformer")
                     yield Checkbox("Enable MobileViT/EdgeViT bottleneck", value=True, id="transformer")
             with Horizontal(id="actions"):
@@ -131,10 +136,17 @@ class NightFlashTUI(App):  # type: ignore[misc]
             str(workers),
             "--device",
             device,
+            # The TUI renders redraws in its own status line, so let the
+            # trainer emit a normal live bar and we translate it.
+            "--progress",
+            "tqdm",
         ]
         mask = self._value("mask")
         if mask:
             command.extend(["--mask-dir", mask])
+        resume = self._value("resume")
+        if resume:
+            command.extend(["--resume", resume])
         if not self.query_one("#transformer", Checkbox).value:
             command.append("--no-transformer")
         return command
@@ -152,21 +164,36 @@ class NightFlashTUI(App):  # type: ignore[misc]
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+            bufsize=0,  # binary, so "\r" redraws are not rewritten to "\n"
         )
         self._status(f"{label} running (PID {self.process.pid})")
         self.thread = threading.Thread(target=self._read_process, daemon=True)
         self.thread.start()
 
     def _read_process(self) -> None:
+        """Consume output without flooding the log with progress redraws.
+
+        The pipe is read in binary and split by iter_output, which separates
+        complete lines from ``\\r`` redraws. Complete lines go to the log;
+        redraws update a single status line so the log stays readable.
+        """
         process = self.process
         if process is None or process.stdout is None:
             return
-        for line in process.stdout:
-            self.call_from_thread(self._log, line.rstrip())
+        try:
+            for kind, text in iter_output(process.stdout, strip=True):
+                if kind == "line":
+                    self.call_from_thread(self._log, text)
+                else:
+                    self.call_from_thread(self._progress, text)
+        except Exception as exc:  # never let the reader thread die silently
+            self.call_from_thread(self._log, f"stream error: {exc}")
         return_code = process.wait()
         self.call_from_thread(self._on_process_exit, return_code)
+
+    def _progress(self, text: str) -> None:
+        """Show the most recent redraw in the status line only."""
+        self.query_one("#status", Static).update(text[-120:])
 
     def _on_process_exit(self, return_code: int) -> None:
         self.process = None

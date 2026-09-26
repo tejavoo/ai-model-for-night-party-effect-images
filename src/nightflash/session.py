@@ -1,0 +1,649 @@
+"""``Session`` — one object that owns a run.
+
+The goal is that a notebook never has to remember *where* it is. ``Session``
+discovers what already exists on disk, derives the correct absolute epoch target,
+and offers three explicit modes:
+
+``plan``
+    Print what *would* happen. Writes nothing, trains nothing.
+``train``
+    Resume if a checkpoint exists, otherwise start clean. Never silently no-ops.
+``infer``
+    Skip training entirely and just run the model.
+
+Run directories are isolated per architecture and head, so switching
+architectures never overwrites another run::
+
+    runs/edgehat_freqsplit_night/
+      config.json  checkpoints/  previews/  inferences/
+      evaluations/ logs/  warm_start_report.json
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal, Sequence
+
+import numpy as np
+import torch
+from torch import Tensor, nn
+
+from .arch import ARCHITECTURES, HEADS, build_generator, new_arch_config, run_generator
+from .config import ModelConfig
+from .data import UnpairedImageDataset, make_dataloaders
+from .effects import apply_stochastic_effects
+from .geometry import prepare, restore
+from .losses import (
+    adversarial_loss,
+    content_loss,
+    effect_regularization,
+    identity_loss,
+    moment_loss,
+)
+from .models import PatchDiscriminator
+from .progress import create_reporter
+from .utils import ensure_dir, resolve_device, save_json, save_preview, seed_everything
+
+Mode = Literal["plan", "train", "infer"]
+
+SUBDIRS = ("checkpoints", "previews", "inferences", "evaluations", "logs")
+
+
+def slugify(text: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "-", text).strip("-").lower()
+
+
+@dataclass
+class RunState:
+    """What exists on disk for one run directory."""
+
+    run_dir: Path
+    exists: bool
+    has_config: bool
+    has_checkpoint: bool
+    has_warm_start: bool
+    last_epoch: int | None = None
+    global_step: int | None = None
+    saved_arch: str | None = None
+    saved_head: str | None = None
+    capabilities: list[str] = field(default_factory=list)
+    checkpoint_bytes: int = 0
+    preview_count: int = 0
+    inference_count: int = 0
+    issue: str | None = None
+
+    @property
+    def status(self) -> str:
+        if self.issue:
+            return f"BLOCKED: {self.issue}"
+        if not self.exists:
+            return "NEW - no run directory yet, will start from scratch"
+        if not self.has_checkpoint:
+            return "EMPTY - directory exists but no checkpoint, will start from scratch"
+        return (
+            f"RESUMABLE - epoch {self.last_epoch} of {self.last_epoch + 1} done, "
+            f"global step {self.global_step}"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_dir": str(self.run_dir),
+            "exists": self.exists,
+            "status": self.status,
+            "has_config": self.has_config,
+            "has_checkpoint": self.has_checkpoint,
+            "has_warm_start": self.has_warm_start,
+            "last_epoch": self.last_epoch,
+            "global_step": self.global_step,
+            "saved_arch": self.saved_arch,
+            "saved_head": self.saved_head,
+            "capabilities": self.capabilities,
+            "checkpoint_mb": round(self.checkpoint_bytes / 1e6, 1),
+            "previews": self.preview_count,
+            "inferences": self.inference_count,
+            "issue": self.issue,
+        }
+
+
+class Session:
+    """Owns one run: config, directories, state discovery, and execution."""
+
+    def __init__(
+        self,
+        *,
+        arch: str = "edgehat",
+        head: str = "freqsplit",
+        name: str = "night",
+        source_dir: str | Path | None = None,
+        target_dir: str | Path | None = None,
+        val_dir: str | Path | None = None,
+        mask_dir: str | Path | None = None,
+        runs_root: str | Path = "runs",
+        image_size: int = 256,
+        batch_size: int = 8,
+        epochs: int = 50,
+        device: str = "auto",
+        use_amp: bool = True,
+        seed: int = 0,
+        num_workers: int = 2,
+        preview_every: int = 250,
+        log_every: int = 25,
+        effects_strength: float = 0.5,
+        halation: bool = True,
+        subject_gate: bool = True,
+        region_exposure: bool = True,
+        resume: bool = True,
+        **arch_overrides: Any,
+    ) -> None:
+        if arch not in ARCHITECTURES:
+            raise ValueError(f"arch must be one of {ARCHITECTURES}, got {arch!r}")
+        if head not in HEADS:
+            raise ValueError(f"head must be one of {HEADS}, got {head!r}")
+
+        self.config: ModelConfig = new_arch_config(
+            arch,
+            head=head,
+            use_halation=halation,
+            use_subject_gate=subject_gate,
+            use_region_exposure=region_exposure,
+            **arch_overrides,
+        )
+        self.name = name
+        self.source_dir = Path(source_dir) if source_dir else None
+        self.target_dir = Path(target_dir) if target_dir else None
+        self.val_dir = Path(val_dir) if val_dir else None
+        self.mask_dir = Path(mask_dir) if mask_dir else None
+        self.image_size = image_size
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.device = device
+        self.use_amp = use_amp
+        self.seed = seed
+        self.num_workers = num_workers
+        self.preview_every = preview_every
+        self.log_every = log_every
+        self.effects_strength = effects_strength
+        self.resume_enabled = resume
+
+        folder = f"{arch}_{head}{'_' + name if name else ''}"
+        self.run_dir = Path(runs_root) / folder
+        for sub in SUBDIRS:
+            ensure_dir(self.run_dir / sub)
+
+    # ------------------------------------------------------------------ paths
+
+    @property
+    def checkpoint_dir(self) -> Path:
+        return self.run_dir / "checkpoints"
+
+    @property
+    def latest(self) -> Path:
+        return self.checkpoint_dir / "latest.pt"
+
+    @property
+    def preview_dir(self) -> Path:
+        return self.run_dir / "previews"
+
+    @property
+    def inference_dir(self) -> Path:
+        return self.run_dir / "inferences"
+
+    @property
+    def log_path(self) -> Path:
+        return self.run_dir / "logs" / "train.log"
+
+    # ------------------------------------------------------------------ state
+
+    def state(self) -> RunState:
+        """Inspect the run directory without modifying anything."""
+
+        state = RunState(
+            run_dir=self.run_dir,
+            exists=self.run_dir.exists(),
+            has_config=(self.run_dir / "config.json").exists(),
+            has_checkpoint=self.latest.exists(),
+            has_warm_start=(self.run_dir / "warm_start_report.json").exists(),
+        )
+        if state.exists and state.has_config:
+            saved = json.loads((self.run_dir / "config.json").read_text())
+            model_config = ModelConfig.from_dict(saved.get("model_config", {}))
+            state.saved_arch = model_config.arch
+            state.saved_head = model_config.head
+            state.capabilities = model_config.capability_names()
+            if state.saved_arch != self.config.arch:
+                state.issue = (
+                    f"this run directory was created for arch={state.saved_arch!r} but you "
+                    f"asked for {self.config.arch!r}; use a different name or runs_root"
+                )
+            elif state.saved_head != self.config.head:
+                state.issue = (
+                    f"this run directory was created for head={state.saved_head!r} but you "
+                    f"asked for {self.config.head!r}"
+                )
+
+        if state.has_checkpoint:
+            checkpoint = torch.load(self.latest, map_location="cpu", weights_only=False)
+            state.last_epoch = int(checkpoint.get("epoch", -1))
+            state.global_step = int(checkpoint.get("global_step", 0))
+            state.checkpoint_bytes = self.latest.stat().st_size
+            saved_config = ModelConfig.from_dict(checkpoint.get("model_config", {}))
+            if saved_config.arch != self.config.arch or saved_config.head != self.config.head:
+                state.issue = (
+                    f"checkpoint holds arch={saved_config.arch}/head={saved_config.head} but "
+                    f"this session wants {self.config.arch}/{self.config.head}"
+                )
+
+        state.preview_count = len(list(self.preview_dir.glob("*.png")))
+        state.inference_count = len(list(self.inference_dir.glob("*")))
+        return state
+
+    def target_epoch(self, extra_epochs: int | None = None) -> int:
+        """Absolute epoch to train to.
+
+        ``--epochs`` style semantics: this returns ``last_epoch + 1 + extra``, so
+        a resume can never land on an empty loop and silently train nothing.
+        """
+
+        state = self.state()
+        start = 0 if state.last_epoch is None else state.last_epoch + 1
+        extra = self.epochs if extra_epochs is None else extra_epochs
+        return start + extra
+
+    # ------------------------------------------------------------------ plan
+
+    def plan(self, mode: Mode = "plan", extra_epochs: int | None = None) -> dict[str, Any]:
+        """Describe exactly what would happen. Writes nothing."""
+
+        state = self.state()
+        goal = self.target_epoch(extra_epochs)
+        start = 0 if state.last_epoch is None else state.last_epoch + 1
+        would_train = mode == "train" and state.issue is None and goal > start
+
+        return {
+            "mode": mode,
+            "run_dir": str(self.run_dir),
+            "arch": self.config.arch,
+            "head": self.config.head,
+            "capabilities": self.config.capability_names(),
+            "state": state.to_dict(),
+            "start_epoch": start,
+            "target_epoch": goal,
+            "epochs_this_call": max(0, goal - start) if would_train else 0,
+            "would_train": would_train,
+            "action": self._action_text(mode, state, start, goal),
+        }
+
+    def _action_text(
+        self, mode: Mode, state: RunState, start: int, goal: int
+    ) -> str:
+        if state.issue:
+            return f"BLOCKED - {state.issue}"
+        if mode == "infer":
+            if not state.has_checkpoint:
+                return "INFER - no checkpoint yet, nothing to run"
+            return f"INFER - load {self.latest} and write to {self.inference_dir}, no training"
+        if mode == "plan":
+            if not state.has_checkpoint:
+                return f"PLAN - would start fresh and train epochs 1..{goal}"
+            return f"PLAN - would resume from epoch {start} and train to {goal}"
+        if goal <= start:
+            return (
+                f"NO-OP GUARD - already at epoch {start - 1}; target {goal} would train "
+                "zero epochs. Ask for more epochs."
+            )
+        if not state.has_checkpoint:
+            return f"TRAIN - start fresh, epochs 1..{goal}"
+        return f"TRAIN - resume from epoch {start}, train to {goal}"
+
+    def write_config(self) -> None:
+        save_json(
+            self.run_dir / "config.json",
+            {
+                "model_config": self.config.to_dict(),
+                "name": self.name,
+                "image_size": self.image_size,
+                "batch_size": self.batch_size,
+                "device": self.device,
+                "amp": self.use_amp,
+                "seed": self.seed,
+                "preview_every": self.preview_every,
+                "log_every": self.log_every,
+                "effects_strength": self.effects_strength,
+                "source_dir": str(self.source_dir) if self.source_dir else None,
+                "target_dir": str(self.target_dir) if self.target_dir else None,
+                "val_dir": str(self.val_dir) if self.val_dir else None,
+                "mask_dir": str(self.mask_dir) if self.mask_dir else None,
+            },
+        )
+
+    # ------------------------------------------------------------------ train
+
+    def train(
+        self,
+        extra_epochs: int | None = None,
+        *,
+        mode: Mode = "train",
+    ) -> dict[str, Any]:
+        info = self.plan(mode=mode, extra_epochs=extra_epochs)
+        if not info["would_train"]:
+            return info
+        if self.source_dir is None or self.target_dir is None:
+            raise ValueError("source_dir and target_dir are required to train")
+
+        goal = int(info["target_epoch"])
+        seed_everything(self.seed)
+        self.write_config()
+        device = resolve_device(self.device)
+        use_mask = self.mask_dir is not None
+        if use_mask:
+            self.config.use_mask = True
+
+        model = build_generator(self.config).to(device)
+        discriminator = PatchDiscriminator().to(device)
+        optimizer_g = torch.optim.AdamW(model.parameters(), lr=2e-4, betas=(0.5, 0.999), weight_decay=1e-4)
+        optimizer_d = torch.optim.AdamW(discriminator.parameters(), lr=1e-4, betas=(0.5, 0.999), weight_decay=1e-4)
+
+        start_epoch = int(info["start_epoch"])
+        global_step = 0
+        if self.resume_enabled and self.latest.exists():
+            checkpoint = torch.load(self.latest, map_location=device, weights_only=False)
+            saved = ModelConfig.from_dict(checkpoint.get("model_config", {}))
+            if saved.arch == self.config.arch and saved.head == self.config.head:
+                model.load_state_dict(checkpoint["model"])
+                discriminator.load_state_dict(checkpoint["discriminator"])
+                optimizer_g.load_state_dict(checkpoint["optimizer_g"])
+                optimizer_d.load_state_dict(checkpoint["optimizer_d"])
+                start_epoch = int(checkpoint.get("epoch", -1)) + 1
+                global_step = int(checkpoint.get("global_step", 0))
+                print(f"resumed from {self.latest} (epoch {start_epoch}, step {global_step})")
+
+        train_loader, preview_loader, preview_dataset = make_dataloaders(
+            self.source_dir, self.target_dir,
+            image_size=self.image_size, batch_size=self.batch_size,
+            mask_dir=self.mask_dir, num_workers=self.num_workers, seed=self.seed,
+        )
+        if len(train_loader) == 0:
+            raise ValueError("empty DataLoader; reduce --batch-size or add images")
+
+        amp_enabled = bool(self.use_amp and device.type == "cuda")
+        scaler = torch.amp.GradScaler("cuda") if amp_enabled else None
+        reporter = create_reporter(mode="auto", log_every=self.log_every)
+
+        print(f"arch={self.config.arch} head={self.config.head} "
+              f"caps={self.config.capability_names() or '-'}")
+        print(f"parameters: generator {sum(p.numel() for p in model.parameters()):,}")
+        print(f"epochs {start_epoch}..{goal - 1}  device={device}")
+
+        for epoch in range(start_epoch, goal):
+            model.train()
+            discriminator.train()
+            reporter.start_epoch(epoch + 1, goal, len(train_loader))
+            epoch_start = time.time()
+            step_in_epoch = 0
+            running: dict[str, float] = {}
+
+            for batch in train_loader:
+                source = batch["source"].to(device, non_blocking=True)
+                target = batch["target"].to(device, non_blocking=True)
+                mask = batch["mask"].to(device, non_blocking=True)
+                model_input = torch.cat([source, mask], dim=1) if use_mask else source
+
+                optimizer_d.zero_grad(set_to_none=True)
+                residual, effect_params, _ = run_generator(model, model_input, mask)
+                styled = self._compose(source, residual, effect_params, training=True)
+                loss_d = 0.5 * (
+                    adversarial_loss(discriminator(target), True)
+                    + adversarial_loss(discriminator(styled.detach()), False)
+                )
+                loss_d.backward()
+                optimizer_d.step()
+
+                optimizer_g.zero_grad(set_to_none=True)
+                residual, effect_params, _ = run_generator(model, model_input, mask)
+                styled = self._compose(source, residual, effect_params, training=True)
+                loss_adv = adversarial_loss(discriminator(styled), True)
+                loss_content = content_loss(styled, source, mask if use_mask else None)
+                loss_moment = moment_loss(styled, target)
+                target_input = torch.cat([target, torch.zeros_like(mask)], dim=1) if use_mask else target
+                t_residual, _, _ = run_generator(model, target_input, mask)
+                loss_identity = identity_loss(torch.clamp(target + t_residual, 0.0, 1.0), target)
+                loss_g = (
+                    loss_adv + 1.5 * loss_content + 0.35 * loss_moment
+                    + 0.75 * loss_identity + 0.02 * effect_regularization(effect_params)
+                )
+                loss_g.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer_g.step()
+
+                global_step += 1
+                step_in_epoch += 1
+                metrics = {
+                    "loss_d": float(loss_d.detach().cpu()),
+                    "loss_g": float(loss_g.detach().cpu()),
+                    "adv": float(loss_adv.detach().cpu()),
+                    "content": float(loss_content.detach().cpu()),
+                    "identity": float(loss_identity.detach().cpu()),
+                }
+                for key, value in metrics.items():
+                    running[key] = running.get(key, 0.0) + value
+                reporter.update(step_in_epoch, metrics)
+
+                if self.preview_every > 0 and global_step % self.preview_every == 0:
+                    self._preview(model, preview_loader, device, epoch, global_step, use_mask)
+                    self._save(model, discriminator, optimizer_g, optimizer_d, epoch, global_step)
+                    print(f"preview + checkpoint at step {global_step}")
+
+            reporter.finish_epoch(
+                epoch + 1, goal, time.time() - epoch_start,
+                {k: v / max(step_in_epoch, 1) for k, v in running.items()},
+            )
+            self._save(model, discriminator, optimizer_g, optimizer_d, epoch, global_step)
+            self._preview(model, preview_loader, device, epoch, global_step, use_mask, name=f"epoch-{epoch+1:04d}")
+
+        return {**info, "completed": True, "global_step": global_step}
+
+    # ------------------------------------------------------------------ infer
+
+    def load(self, device: torch.device) -> tuple[nn.Module, dict[str, Any]]:
+        if not self.latest.exists():
+            raise FileNotFoundError(
+                f"no checkpoint at {self.latest}. Run s.train() first, or check s.state()."
+            )
+        checkpoint = torch.load(self.latest, map_location=device, weights_only=False)
+        saved = ModelConfig.from_dict(checkpoint.get("model_config", {}))
+        model = build_generator(saved).to(device)
+        model.load_state_dict(checkpoint["model"])
+        model.eval()
+        return model, checkpoint
+
+    def infer(
+        self,
+        inputs: str | Path | Sequence[str | Path],
+        *,
+        seeds: int = 1,
+        save_comparison: bool = False,
+        device: str | None = None,
+        tile: int = 0,
+        tile_overlap: int = 128,
+    ) -> list[Path]:
+        """Run inference only. Never touches the training loop.
+
+        ``tile=0`` (default) processes the whole frame: nothing is cropped or
+        stretched, but the model sees the image downscaled to ``image_size``.
+
+        ``tile=512`` processes overlapping 512px tiles and crossfades them, so the
+        model works near native resolution. Costs proportionally more compute and
+        makes ``region-exposure`` tile-local. See ``docs/INFERENCE.md``.
+        """
+
+        from PIL import Image, ImageOps
+
+        from .tiles import apply_tiled, estimate_tiles, tile_count
+
+        dev = resolve_device(device or self.device)
+        model, _ = self.load(dev)
+        paths = _expand_inputs(inputs)
+        written: list[Path] = []
+        fit = "letterbox"
+
+        if tile and self.config.use_region_exposure:
+            print(
+                "note: tiled inference makes region-exposure tile-local. "
+                "Train without --region-exposure if you need global regions."
+            )
+
+        def run_frame(image, seed_index: int):
+            """One letterboxed pass. Returns a PIL image of the same size."""
+
+            array, transform = prepare(image, self.image_size, fit=fit)
+            source = torch.from_numpy(array).unsqueeze(0).to(dev)
+            residual, effect_params, _ = run_generator(model, source)
+            deterministic = torch.clamp(source + residual, 0.0, 1.0)
+            restored = restore(deterministic[0].cpu().numpy(), transform)
+            rgb = torch.from_numpy(
+                np.asarray(restored, dtype=np.float32).copy() / 255.0
+            ).permute(2, 0, 1).unsqueeze(0).to(dev)
+            styled = apply_stochastic_effects(
+                rgb, effect_params, seed=self.seed + seed_index,
+                strength=self.effects_strength,
+            )
+            return restore(styled[0].cpu().numpy(), transform)
+
+        with torch.no_grad():
+            for path in paths:
+                image = ImageOps.exif_transpose(Image.open(path).convert("RGB"))
+                for seed_index in range(seeds):
+                    if tile:
+                        count = tile_count(image.width, image.height, tile, tile_overlap)
+                        info = estimate_tiles(image.width, image.height, tile, tile_overlap)
+                        print(
+                            f"{path.name} {image.size} -> tiled: {info['tiles']} tiles "
+                            f"of {tile}px, {info['megapixels_processed']} MP processed"
+                        )
+
+                        def process(piece, seed_index=seed_index):
+                            return run_frame(piece, seed_index)
+
+                        out = apply_tiled(
+                            image, process, tile_size=tile, overlap=tile_overlap
+                        )
+                    else:
+                        out = run_frame(image, seed_index)
+
+                    suffix = "" if seeds == 1 else f"-seed{seed_index}"
+                    mode = "" if not tile else f"-t{tile}"
+                    destination = self.inference_dir / f"{path.stem}{mode}{suffix}.png"
+                    if save_comparison:
+                        canvas = Image.new("RGB", (image.width * 2, image.height))
+                        canvas.paste(image, (0, 0))
+                        canvas.paste(out, (image.width, 0))
+                        canvas.save(destination)
+                    else:
+                        out.save(destination)
+                    written.append(destination)
+                    print(f"{path.name} -> {destination.name}")
+        return written
+
+    # ----------------------------------------------------------------- helpers
+
+    def _compose(
+        self, source: Tensor, residual: Tensor, effect_params: Tensor, *, training: bool
+    ) -> Tensor:
+        deterministic = torch.clamp(source + residual, 0.0, 1.0)
+        if training:
+            return apply_stochastic_effects(
+                deterministic, effect_params, seed=None, strength=self.effects_strength
+            )
+        return deterministic
+
+    def _preview(
+        self, model, preview_loader, device, epoch: int, global_step: int,
+        use_mask: bool, name: str | None = None,
+    ) -> None:
+        model.eval()
+        with torch.no_grad():
+            batch = next(iter(preview_loader))
+            source = batch["source"].to(device)
+            target = batch["target"].to(device)
+            mask = batch["mask"].to(device)
+            model_input = torch.cat([source, mask], dim=1) if use_mask else source
+            residual, effect_params, _ = run_generator(model, model_input, mask)
+            styled = apply_stochastic_effects(
+                torch.clamp(source + residual, 0.0, 1.0), effect_params,
+                seed=424242, strength=self.effects_strength,
+            )
+        filename = name or f"step-{global_step:07d}"
+        if not filename.endswith(".png"):
+            filename = f"{filename}.png"
+        save_preview(self.preview_dir / filename, source[0], styled[0], target[0])
+        model.train()
+
+    def _save(self, model, discriminator, optimizer_g, optimizer_d, epoch, global_step) -> None:
+        payload = {
+            "model": model.state_dict(),
+            "discriminator": discriminator.state_dict(),
+            "optimizer_g": optimizer_g.state_dict(),
+            "optimizer_d": optimizer_d.state_dict(),
+            "model_config": self.config.to_dict(),
+            "epoch": epoch,
+            "global_step": global_step,
+        }
+        torch.save(payload, self.latest)
+        torch.save(payload, self.checkpoint_dir / f"epoch-{epoch + 1:04d}.pt")
+
+    # ------------------------------------------------------------------- misc
+
+    def reset(self, *, archive: bool = True, keep_config: bool = True) -> Path | None:
+        """Clear checkpoints and outputs so the next run starts from zero.
+
+        By default the old run is moved to ``<run_dir>_archive_<n>`` rather than
+        deleted, so a 40-epoch baseline is never lost to a stray call. Pass
+        ``archive=False`` to delete outright.
+        """
+
+        if not self.run_dir.exists():
+            return None
+
+        destination: Path | None = None
+        if archive and any(self.run_dir.iterdir()):
+            index = 1
+            while (candidate := self.run_dir.with_name(f"{self.run_dir.name}_archive_{index}")).exists():
+                index += 1
+            shutil.move(str(self.run_dir), str(candidate))
+            destination = candidate
+        else:
+            # In-place wipe: the subdirectories must actually be removed.
+            for sub in ("checkpoints", "previews", "inferences", "evaluations", "logs"):
+                target = self.run_dir / sub
+                if target.exists():
+                    shutil.rmtree(target)
+
+        for sub in SUBDIRS:
+            ensure_dir(self.run_dir / sub)
+        if not keep_config and (self.run_dir / "config.json").exists():
+            (self.run_dir / "config.json").unlink()
+        if destination is not None:
+            print(f"archived previous run -> {destination}")
+        print(f"reset {self.run_dir} (checkpoints and previews cleared)")
+        return destination
+
+    def __repr__(self) -> str:
+        return f"Session(arch={self.config.arch!r}, head={self.config.head!r}, run_dir={str(self.run_dir)!r})"
+
+
+def _expand_inputs(inputs: str | Path | Sequence[str | Path]) -> list[Path]:
+    from .data import IMAGE_EXTENSIONS, list_images
+
+    if isinstance(inputs, (str, Path)):
+        path = Path(inputs).expanduser()
+        if path.is_dir():
+            return list_images(path)
+        if path.is_file():
+            return [path]
+        raise FileNotFoundError(path)
+    return [Path(p).expanduser() for p in inputs]

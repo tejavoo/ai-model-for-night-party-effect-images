@@ -71,6 +71,158 @@ Use one seed per captured shot if you want reproducible results. For video, smoo
 
 `0.0` is equivalent to `--no-effects` for the rendered result.
 
+## Aspect ratio: no more stretching or cropping
+
+Training uses square `N×N` crops. The earlier inference path resized every input
+to a square with `ImageOps.fit`, which **centre-crops**, and then resized the
+square result back to the original dimensions, which **stretches**. A 600×800
+photo lost 25% of its height and came back distorted.
+
+Both are fixed. `--fit` now controls the behaviour:
+
+| Mode | Model input | Content | Geometry | Global context |
+|---|---|---|---|---|
+| `letterbox` (default) | `512×512` padded | **all kept** | exact | matches training |
+| `native` | true aspect, e.g. `512×688` | **all kept** | exact | shifted scale |
+| `crop` (legacy) | `512×512` | **edges lost** | stretched | matches training |
+
+```bash
+nightflash-infer --checkpoint ck.pt --input photo.jpg --output out.png
+# default: letterbox
+```
+
+How it works: the image is scaled to fit inside the square, the remainder is
+padded, the model runs, then the padding is cropped away **before** the final
+resize. Because the crop happens first, no padding bleeds in and nothing is
+stretched.
+
+Verified on a 600×800 frame with coloured landmark dots:
+
+| Mode | Top-left dot at y=0.15 lands at | Verdict |
+|---|---|---|
+| `letterbox` | y = 0.15 | correct |
+| `native` | y = 0.15 | correct |
+| `crop` | y = 0.03 | content destroyed |
+
+Other options:
+
+```bash
+--fit letterbox --pad-mode reflect   # smoother border than edge replication
+--fit native --image-size 512        # better context, shifted receptive field
+--fit crop                           # only to reproduce old results
+```
+
+### Why `letterbox` is the default
+
+`native` preserves more global context, but it also shifts the model's effective
+receptive field. A 128px receptive field covers 25% of a 512 frame and only 16% of
+an 800px-wide frame, so `native` presents the network with a distribution it was
+not trained on. `letterbox` keeps the input square, matching training exactly,
+and the padding is cropped away before delivery.
+
+### Effects are rendered at output resolution
+
+`--effects-at output` (default) un-pads and resizes to the delivered size
+**first**, then applies grain/leak/vignette. This matters: rendering grain at
+512px and then upscaling to 800px would make the grain 1.56× too large and soft.
+
+```bash
+--effects-at model   # cheaper; grain gets rescaled with the image
+```
+
+### Vignette and leak are now aspect-correct
+
+The vignette used to normalise each axis independently to `[-1, 1]`, so on a
+192×256 frame an equal 40px step produced **33% more falloff vertically** than
+horizontally — an oval instead of a circle. Both effects now share one scale
+derived from the shorter side, and the measured anisotropy is **0.000000**.
+
+This also means the same `effectParams` vector means the same thing on a phone
+photo, a 3:2 crop, and a square preview.
+
+## Tiled inference — optional, for real detail
+
+The whole-frame path is correct but heavily downscaled. Measured scale factor of
+what the network actually sees:
+
+| input | `--fit letterbox` | `--fit native` |
+|---|---|---|
+| 600×800 | 256×256, **0.32×** | 256×344, **0.43×** |
+| 1920×1080 | 256×256, **0.13×** | 456×256, **0.24×** |
+| 4032×3024 | 256×256, **0.06×** | 344×256, **0.085×** |
+
+At `--image-size 256` a 12-megapixel phone photo is letterboxed to 6% scale. Tone
+and colour survive; grain and halation detail do not.
+
+Tiling fixes the scale rather than the geometry:
+
+```bash
+# whole frame (default) — nothing cropped, but heavily downscaled
+nightflash-infer --checkpoint ck.pt --input big.jpg --output out.png
+
+# tiled — model works near native resolution, crossfaded
+nightflash-infer --checkpoint ck.pt --input big.jpg --output big-t512.png \
+                 --tile 512 --tile-overlap 128
+```
+
+```python
+s.infer("big.jpg")                     # whole frame
+s.infer("big.jpg", tile=512)           # full-resolution detail
+s.infer("big.jpg", tile=512, tile_overlap=256)   # smoother, more cost
+```
+
+Tiled output is written as `<stem>-t512.png` so it never overwrites the
+whole-frame result.
+
+### Choosing a tile size
+
+| tile | overlap | good for | tiles on 4032×3024 |
+|---:|---:|---|---:|
+| 256 | 64 | matches a 256px training run | 336 |
+| 512 | 128 | a 512px model, or a good balance | 88 |
+| 1024 | 256 | a 1024px model, large frames | 24 |
+
+Match the tile to `--image-size`. A 256px model asked to process 1024px tiles is
+being run far outside its training scale, and the receptive-field argument from
+above applies inside the tile.
+
+The trainer prints the cost before it starts:
+
+```text
+big.jpg (1600, 1200) -> tiled: 12 tiles of 512px, 3.1 MP processed
+```
+
+### What tiling changes semantically
+
+- **`region-exposure` becomes tile-local.** Its 4×4 grid now describes a tile, not
+  the photograph. Train with `--no-region-exposure` if you need global regions.
+  `Session.infer` prints a note when it detects this combination.
+- **Halation across tile borders** is weakened, because the highlight field is
+  truncated. The overlap hides most of it.
+- **Subject gate** is computed per tile, which usually helps on large subjects.
+
+### Seam behaviour
+
+Tiles are crossfaded with a raised-cosine (Hann) window, so seams are zero by
+construction rather than blended away afterwards. Measured:
+
+| check | result |
+|---|---|
+| corners round-trip | exact, all four |
+| linear gradient stays linear | mean error 0.10/255 |
+| checkerboard spurious step | none (step equals the original 255) |
+| output size and aspect | identical to input |
+
+Two implementation details that are easy to get wrong, and were:
+
+1. **Every tile is exactly `tile_size`**, edge-replicated where it runs off-frame.
+   Partial edge tiles have a window approaching zero at the border.
+2. **The window floor must be applied to numerator and denominator identically.**
+   Since the blend is `sum(w·pixel) / sum(w)`, clamping only the denominator
+   scales the output — an earlier version turned all four corners black.
+
+---
+
 ## Mid-training checkpoints
 
 Training writes:

@@ -7,11 +7,10 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch import Tensor, nn
-from tqdm import tqdm
+from torch import Tensor
 
 from .config import ModelConfig, TrainPaths
-from .data import UnpairedImageDataset, make_dataloaders
+from .data import make_dataloaders
 from .effects import apply_stochastic_effects
 from .losses import (
     adversarial_loss,
@@ -21,6 +20,7 @@ from .losses import (
     moment_loss,
 )
 from .models import HybridGenerator, PatchDiscriminator, count_parameters
+from .progress import create_reporter
 from .utils import ensure_dir, resolve_device, save_json, save_preview, seed_everything
 
 
@@ -52,6 +52,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--effect-weight", type=float, default=0.02)
     parser.add_argument("--preview-every", type=int, default=250)
     parser.add_argument("--log-every", type=int, default=25)
+    parser.add_argument(
+        "--progress",
+        choices=["auto", "tqdm", "plain", "none"],
+        default="auto",
+        help="progress style; 'auto' uses a live bar on TTYs and clean lines in notebooks",
+    )
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto")
@@ -217,16 +223,31 @@ def train(args: argparse.Namespace) -> Path:
     print(f"Discriminator parameters: {count_parameters(discriminator):,}")
     print(f"Checkpoints: {checkpoint_dir}")
     print(f"Previews: {preview_dir}")
+    if start_epoch > 0:
+        print(f"Resuming at epoch {start_epoch + 1} (global step {global_step})")
+
+    # --epochs is an absolute target, so a resume at or past it trains nothing.
+    # Fail loudly instead of printing a cheerful "training complete".
+    if start_epoch >= args.epochs:
+        raise SystemExit(
+            f"Nothing to train: --epochs {args.epochs} is not greater than the "
+            f"resume point (epoch {start_epoch + 1}).\n"
+            "--epochs is an ABSOLUTE target, not a count of extra epochs.\n"
+            f"Set --epochs to {start_epoch + 1} + the number of extra epochs you want."
+        )
+
+    reporter = create_reporter(mode=args.progress, log_every=args.log_every)
 
     for epoch in range(start_epoch, args.epochs):
         preview_dataset.set_epoch(epoch)
         model.train()
         discriminator.train()
-        progress = tqdm(train_loader, desc=f"epoch {epoch + 1}/{args.epochs}", leave=False)
+        reporter.start_epoch(epoch + 1, args.epochs, len(train_loader))
         epoch_start = time.time()
+        step_in_epoch = 0
         running: dict[str, float] = {}
 
-        for batch in progress:
+        for batch in train_loader:
             source = batch["source"].to(device, non_blocking=True)
             target = batch["target"].to(device, non_blocking=True)
             mask = batch["mask"].to(device, non_blocking=True)
@@ -298,6 +319,7 @@ def train(args: argparse.Namespace) -> Path:
                 optimizer_g.step()
 
             global_step += 1
+            step_in_epoch += 1
             values = {
                 "loss_d": float(loss_d.detach().cpu()),
                 "loss_g": float(loss_g.detach().cpu()),
@@ -307,10 +329,7 @@ def train(args: argparse.Namespace) -> Path:
             }
             for key, value in values.items():
                 running[key] = running.get(key, 0.0) + value
-            if global_step % args.log_every == 0:
-                averaged = " ".join(f"{key}={value / args.log_every:.4f}" for key, value in running.items())
-                progress.set_postfix_str(averaged)
-                running.clear()
+            reporter.update(step_in_epoch, values)
             if not args.no_preview and args.preview_every > 0 and global_step % args.preview_every == 0:
                 preview_batch = next(iter(preview_loader))
                 preview_path = preview_dir / f"step-{global_step:07d}.png"
@@ -338,7 +357,12 @@ def train(args: argparse.Namespace) -> Path:
 
             if args.max_steps > 0 and global_step >= args.max_steps:
                 break
-        progress.close()
+        reporter.finish_epoch(
+            epoch + 1,
+            args.epochs,
+            time.time() - epoch_start,
+            {key: value / max(step_in_epoch, 1) for key, value in running.items()},
+        )
 
         epoch_path = checkpoint_dir / f"epoch-{epoch + 1:04d}.pt"
         _save_checkpoint(
@@ -373,8 +397,9 @@ def train(args: argparse.Namespace) -> Path:
                 use_mask=use_mask,
                 effects_strength=args.effects_strength,
             )
-        elapsed = time.time() - epoch_start
-        print(f"Epoch {epoch + 1} complete in {elapsed:.1f}s; checkpoint={epoch_path}")
+        print(f"Checkpoint: {epoch_path}")
+        if not args.preview_every or args.preview_every <= 0:
+            print(f"Previews disabled (--preview-every {args.preview_every})")
 
         if args.max_steps > 0 and global_step >= args.max_steps:
             break

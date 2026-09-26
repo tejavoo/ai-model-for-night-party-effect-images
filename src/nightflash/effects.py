@@ -17,6 +17,27 @@ def _seeded_noise(shape: tuple[int, ...], seed: int | None, device: torch.device
     return torch.randn(shape, generator=generator, dtype=dtype).to(device)
 
 
+def _isotropic_coords(
+    height: int, width: int, device: torch.device, dtype: torch.dtype
+) -> tuple[Tensor, Tensor]:
+    """Aspect-corrected coordinates centred on the frame.
+
+    Both axes are normalised by **half the shorter side**, so one unit means the
+    same number of pixels on each axis. That makes circles circular and directions
+    diagonal on any rectangle.
+
+    Normalising each axis independently to ``[-1, 1]`` (the obvious approach) is
+    what produces an elliptical vignette and a skewed light leak on non-square
+    frames: on a 192x256 image ``x = 1`` is 128 px from centre while ``y = 1`` is
+    only 96 px, so equal ``radius`` values are not equal distances.
+    """
+
+    ys = torch.arange(height, device=device, dtype=dtype) - (height - 1) / 2.0
+    xs = torch.arange(width, device=device, dtype=dtype) - (width - 1) / 2.0
+    denominator = max(1.0, min(height, width) / 2.0)
+    return xs / denominator, ys / denominator
+
+
 def _leak_basis(height: int, width: int, device: torch.device, dtype: torch.dtype) -> Tensor:
     """A smooth, inexpensive colored light-leak basis.
 
@@ -25,13 +46,23 @@ def _leak_basis(height: int, width: int, device: torch.device, dtype: torch.dtyp
     decides exactly how the stochastic texture is generated.
     """
 
-    ys = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype)
-    xs = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype)
-    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    xs, ys = _isotropic_coords(height, width, device, dtype)
+    xx, yy = torch.meshgrid(xs, ys, indexing="xy")
     diagonal = torch.sigmoid((xx + 0.65 * yy + 0.35) * 5.0)
     edge = torch.sigmoid((xx - 0.25) * 6.0) * torch.sigmoid((0.85 - yy) * 4.0)
     basis = 0.65 * diagonal + 0.35 * edge
     return basis.clamp(0.0, 1.0).unsqueeze(0).unsqueeze(0)
+
+
+def _vignette(height: int, width: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+    """A circular vignette falloff, normalised so the corner reaches 1.0."""
+
+    xs, ys = _isotropic_coords(height, width, device, dtype)
+    xx, yy = torch.meshgrid(xs, ys, indexing="xy")
+    radius = torch.sqrt(xx.square() + yy.square())
+    side = float(min(width, height))
+    corner = math.sqrt((width / side) ** 2 + (height / side) ** 2)
+    return (radius / max(corner, 1e-6)).clamp(0.0, 1.0).unsqueeze(0).unsqueeze(0)
 
 
 def apply_stochastic_effects(
@@ -101,13 +132,9 @@ def apply_stochastic_effects(
     leak_color = torch.cat([red, green, blue], dim=1)
     styled = styled + basis * leak_color * leak_strength * (0.18 * strength)
 
-    # Soft vignette. Coordinates are normalized to the current tensor, so the
-    # effect is stable for square model inputs and tiled inference.
-    ys = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype)
-    xs = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype)
-    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-    radius = torch.sqrt((xx - 0.0) ** 2 + (yy - 0.0) ** 2) / math.sqrt(2.0)
-    vignette = 1.0 - radius.clamp(0.0, 1.0).unsqueeze(0).unsqueeze(0) * vignette_strength
+    # Vignette. Coordinates are aspect-corrected, so the falloff stays circular
+    # on a 600x800 frame instead of turning into an oval.
+    vignette = 1.0 - _vignette(height, width, device, dtype) * vignette_strength
     styled = styled * vignette
 
     return styled.clamp(0.0, 1.0)

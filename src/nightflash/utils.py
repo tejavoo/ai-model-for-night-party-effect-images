@@ -7,10 +7,10 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch import nn
 from PIL import Image, ImageDraw
 
 from .config import ModelConfig
-from .models import HybridGenerator
 
 
 def seed_everything(seed: int) -> None:
@@ -80,10 +80,18 @@ def save_preview(
 def load_model_checkpoint(
     checkpoint_path: str | Path,
     device: torch.device,
-) -> tuple[HybridGenerator, dict[str, Any]]:
+) -> tuple[nn.Module, dict[str, Any]]:
+    """Rebuild whichever architecture the checkpoint was trained with.
+
+    The architecture is read from the checkpoint's own ``model_config``, never
+    from the caller's arguments, so inference always matches the weights.
+    """
+
+    from .arch import build_generator
+
     checkpoint = torch.load(Path(checkpoint_path), map_location=device, weights_only=False)
     config = ModelConfig.from_dict(checkpoint.get("model_config", {}))
-    model = HybridGenerator(config).to(device)
+    model = build_generator(config).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     return model, checkpoint

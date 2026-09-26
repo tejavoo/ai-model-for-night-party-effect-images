@@ -235,15 +235,22 @@ class PatchDiscriminator(nn.Module):
 
 
 class StyleExportWrapper(nn.Module):
-    """Core ML-friendly wrapper returning styled RGB and effect coefficients."""
+    """Core ML-friendly wrapper returning styled RGB and effect coefficients.
 
-    def __init__(self, generator: HybridGenerator, emit_effects: bool = True) -> None:
+    Accepts any registered generator. ``edgehat`` and ``swinir`` return
+    ``(residual, effects, extras)`` while ``hybrid`` returns a 2-tuple, so the
+    dispatch goes through ``run_generator`` rather than unpacking blindly.
+    """
+
+    def __init__(self, generator: nn.Module, emit_effects: bool = True) -> None:
         super().__init__()
         self.generator = generator
         self.emit_effects = emit_effects
 
     def forward(self, x: Tensor) -> Tensor | tuple[Tensor, Tensor]:
-        residual, effects = self.generator(x)
+        from .arch import run_generator
+
+        residual, effects, _ = run_generator(self.generator, x)
         styled = torch.clamp(x[:, :3] + residual, min=0.0, max=1.0)
         if self.emit_effects:
             return styled, effects

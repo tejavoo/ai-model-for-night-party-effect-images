@@ -261,6 +261,97 @@ This is the first thing to try if Core ML export fails.
 
 Do not assume more epochs automatically improve quality. Unpaired GANs can overfit the target domain and damage content preservation.
 
+## Progress output in notebooks
+
+`tqdm` draws its bar with carriage returns on **stderr**. That works in a
+terminal but not in a notebook, where it produces two problems:
+
+1. The bar is often invisible, because the kernel frontend does not redraw
+   stderr `\r` output.
+2. When the trainer is driven through `subprocess.Popen(..., text=True)`, Python's
+   *universal newlines* translation rewrites every `\r` into `\n`. Each redraw of
+   the bar becomes its own printed line, flooding the cell with hundreds of
+   near-identical lines.
+
+`train.py` handles this at the source. `--progress auto` (the default) picks:
+
+| Environment | Behaviour |
+|---|---|
+| Real TTY, not a notebook | live `tqdm` bar |
+| Notebook, or piped output | one clean newline-terminated line per update |
+
+Force it either way:
+
+```bash
+--progress plain     # always one line per update (notebook-safe)
+--progress tqdm      # always a live bar
+--progress none      # silent, for scripted runs
+```
+
+Plain output looks like this:
+
+```text
+epoch 3/50 started (125 steps, log every 25)
+  [ 20.0%] epoch 3/50 step 25/125 eta=1m12s  loss_d=0.5310 loss_g=1.3765 adv=0.9213
+  [ 40.0%] epoch 3/50 step 50/125 eta=48s    loss_d=0.5050 loss_g=1.2898 adv=0.8762
+epoch 3/50 complete in 3m01s  loss_d=0.5182 loss_g=1.3310
+```
+
+`--log-every` controls the update cadence for both styles.
+
+### Driving the trainer from a notebook
+
+Use the helper rather than raw `Popen`. It reads the pipe in **binary** mode, so
+carriage returns are never rewritten, and it separates real lines from in-place
+redraws:
+
+```python
+from nightflash.notebook import train, show_previews, last_checkpoint
+
+train([
+    "--source-dir", f"{ROOT}/training_photos/normal_photos",
+    "--target-dir", f"{ROOT}/training_photos/disposable_photos",
+    "--output-dir", f"{ROOT}/runs/hybrid-warm",
+    "--image-size", "256", "--batch-size", "16", "--epochs", "50",
+    "--num-workers", "2", "--preview-every", "25", "--log-every", "25",
+    "--device", "cuda", "--amp",
+    "--transformer-blocks", "1",
+], root="/content", log=f"{ROOT}/runs/hybrid-warm/train.log")
+
+show_previews(f"{ROOT}/runs/hybrid-warm", n=6)
+```
+
+If you must use `Popen` yourself, the two rules are:
+
+```python
+# 1. binary mode, so universal newlines cannot split redraws
+proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+
+# 2. split redraws from lines yourself
+from nightflash.streaming import iter_output
+for kind, text in iter_output(proc.stdout):
+    if kind == "line":
+        print(text)                   # safe to print
+    else:
+        status_widget.update(text)    # overwrite in place
+```
+
+A `text=True` pipe plus a plain `for line in process.stdout` is the broken
+combination. `tests/test_progress_streaming.py` asserts the difference.
+
+---
+
+## Resuming and warm starting
+
+`--epochs` is an **absolute target**, not a count of extra epochs. Resuming with
+`--epochs` at or below the checkpoint's epoch trains nothing; the trainer now
+exits with an explicit error instead of reporting false success. To move from a
+trained conv model to a hybrid one, use `scripts/warm_start.py`.
+
+Both are covered in [`WARM_START.md`](WARM_START.md).
+
+---
+
 ## When training looks unstable
 
 Use these steps in order:

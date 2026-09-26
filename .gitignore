@@ -20,6 +20,11 @@ previews/
 # Local datasets
 data/
 datasets/
+training_photos/.cache/
+training_photos/**/*.jpg
+training_photos/**/*.jpeg
+training_photos/**/*.png
+training_photos/**/*.webp
 *.zip
 *.tar
 *.tar.gz

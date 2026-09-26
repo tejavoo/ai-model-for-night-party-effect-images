@@ -1,14 +1,19 @@
-"""Night Flash Edge: compact unpaired image-to-image training toolkit."""
+"""Night Flash: compact unpaired image-to-image training and Core ML export."""
 
-from .config import ModelConfig, TrainPaths
-from .models import HybridGenerator, PatchDiscriminator, StyleExportWrapper
+from .arch import ARCHITECTURES, HEADS, build_generator, new_arch_config, run_generator
+from .briefing import brief
+from .config import ModelConfig
+from .session import Session
 
 __all__ = [
+    "Session",
     "ModelConfig",
-    "TrainPaths",
-    "HybridGenerator",
-    "PatchDiscriminator",
-    "StyleExportWrapper",
+    "brief",
+    "build_generator",
+    "new_arch_config",
+    "run_generator",
+    "ARCHITECTURES",
+    "HEADS",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

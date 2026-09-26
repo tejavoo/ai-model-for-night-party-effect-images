@@ -1,84 +1,241 @@
 # Architecture notes
 
-## Generator
+Two generations of generator live side by side. `edgehat` is the current default;
+`hybrid` and `restormer` are retained so older checkpoints keep loading and stay
+comparable.
 
-The default generator is a hybrid image-to-image network:
+| arch | params | attention | notes |
+|---|---:|---|---|
+| `edgehat` | 4.02 M | local windows + one global block | current default |
+| `swinir` | 4.90 M | windowed, relative position bias | comparison arm |
+| `restormer` | 0.76 M | over channels | cheapest, C×C attention |
+| `hybrid` | 0.76 M | pooled 16×16 tokens | original, keeps old checkpoints |
 
-```text
-input RGB or RGB+mask
-→ shallow convolution
-→ three stride-2 depthwise-separable stages
-→ low-resolution MobileViT/EdgeViT-style bottleneck
-→ bilinear upsampling
-→ three decoder stages with skip connections
-→ bounded RGB residual
-→ eight effect coefficients
-```
+---
 
-The residual is bounded by `residual_scale`, currently `0.35`, to prevent early training from destroying the source.
-
-The default configuration is deliberately compact:
+## `edgehat`
 
 ```text
-base channels:       48
-bottleneck channels: 256
-transformer blocks:  1
-token grid:          16x16
+input RGB  (+ optional person mask)
+ │
+ ├─ stem 3×3 → 48
+ ├─ down1 → 96    stride 2
+ ├─ down2 → 192   stride 2
+ ├─ down3 → 384   stride 2
+ ├─ down4 → 384   stride 2
+ │
+ ├─ L4 (384)  EdgeViTBlock ×1  local windowed attention
+ │            HATBlock    ×1  overlapping cross-attention, global
+ │
+ ├─ L3 (192)  EdgeViTBlock ×2  local windowed attention
+ │
+ ├─ fuse: 384 + 192 → 192
+ ├─ up2: 192 + 96  → 96
+ ├─ up1: 96  + 48  → 48
+ │
+ ├─ head (freqsplit / perpixel / lut3d / tanh) → RGB residual
+ ├─ effect head → 8 stochastic coefficients
+ │
+ └─ three optional extras, composed onto the RGB residual:
+      subject gate      soft S(x,y), mask-guided when supplied
+      region exposure   4×4 coefficients, bilinearly upsampled
+      halation          thresholded highlight, dilated spread, warm tint
 ```
 
-This is roughly a sub-million-parameter generator. If the pilot underfits, increase the channel counts gradually, for example `--base-channels 64 --bottleneck-channels 384`, and compare latency before scaling further.
+Level widths are `stem=48, s2=96, s3=192, s4=384, s5=384`. The deep stages fuse
+once at `s3`, which is where L3 attention (192ch) and L4 attention (384ch) meet.
 
-## Stochastic effects
+### Why these attention types
 
-The effect head predicts coefficients, not a full random image.
+**EdgeViT local attention** runs over the `window × window` tokens of an 8×8
+window at full channel width. Cost is `O(window⁴)` per window and **independent
+of input resolution**, so 256px and 600×800 cost the same. The positional term is
+a depthwise conv folded into the key (CPVT style) rather than a learned table, so
+there is nothing to interpolate when the aspect ratio changes.
 
-The Python renderer applies:
+**HAT overlapping cross-attention** exists because local blocks cannot see the
+whole frame. It pools to a coarse token grid, attends there, and projects back.
+One block buys global lighting context without paying for full attention.
 
-- Grain
-- Light leak
-- Exposure offset
-- Saturation
-- Vignette
-- Leak color tint
+The alternative — attention over *channels* as in Restormer — produces a `C×C`
+matrix that is also resolution independent, but it mixes features without any
+spatial locality, so it cannot express "this region is brighter than that one".
+For a photographic look that needs local tone decisions, spatial attention is the
+better fit.
 
-This separation is intentional:
+### The three extras
 
-- The model learns what style strength is appropriate.
-- The renderer controls randomness and reproducibility.
-- The app can move the renderer to Metal.
-- Core ML does not need a random operator.
+All three are photometric 3-channel terms applied to the RGB residual, and all
+three are gated by a learnable scalar **initialised to zero**. A freshly built
+model is therefore exactly the plain residual: the extras can only help once
+training gives them a reason to switch on, which is what keeps early steps stable.
+
+**Halation** is a physical operator, not a learned guess:
+
+```text
+luma      = Y · (0.2126, 0.7152, 0.0722)
+highlight = relu(luma − threshold) / (1 − threshold)
+spill     = dilated depthwise blur(highlight)      # wide receptive field, cheap
+glow      = relu(spill + tonal(features)) · tint
+```
+
+Light scattering through the film base is a low-pass operation on over-threshold
+luminance, so a dilated depthwise blur is a faithful and very cheap model. A
+learned conv stack would be strictly worse here: more parameters, less physics,
+and no reason to generalise to a highlight the training set never contained.
+
+**Subject gate** produces a soft `S(x,y) ∈ [0,1]` from mid-level features. When
+a Vision person mask is supplied it is adaptively max-pooled to the same grid and
+added, so the gate is *guided* rather than guessed. Tone is then modulated as
+`residual + mix · S · tanh(residual)`, letting the subject diverge from the
+background without letting either region run away.
+
+**Region exposure** pools to a `4×4` grid and applies a 1×1 convolution, so each
+cell's coefficients are conditioned on that cell's own features. Flattening the
+grid into one large linear layer would couple every cell to every other and cost
+far more parameters for a worse result.
+
+---
+
+## Output heads
+
+The head decides what the network is even allowed to do.
+
+| head | learns | params | character |
+|---|---|---:|---|
+| `tanh` | bounded delta (±`residual_scale`) | 21 k | safest with little data, but feels like a global filter |
+| `perpixel` | unbounded delta, clamped on read | 42 k | free to repaint pixels, not just shift colour |
+| `freqsplit` | low / mid / high bands separately | 63 k | routes grain and halation into the high band |
+| `lut3d` | 33³ colour LUT **+ per-pixel conv** | 129 k | global grade *and* local detail in one head |
+
+`freqsplit` uses a fixed 3-tap blur and its complement as band separators, so the
+head stays a plain convolutional network while each frequency band still gets its
+own pathway.
+
+`lut3d` is implemented with **explicit trilinear gathers**, not `grid_sample`.
+`F.grid_sample` was found returning near-centre values regardless of the grid it
+was given, and Core ML support is uneven; eight gathered corners blended by
+trilinear weights is exact, trivially testable, and lowers to plain indexing. An
+identity LUT now reproduces the input to within `1.2e-7`.
+
+### Composite heads
+
+Heads can be combined with `+`. A `CompositeHead` sums its members and clamps
+once, so a composite is still a bounded residual no matter how many parts it has.
+
+| composite | params | when it earns its place |
+|---|---:|---|
+| `lut3d+freqsplit` | 192 k | **best default.** Global grade + local band detail; the parts are complementary |
+| `lut3d+perpixel` | 171 k | global grade + unconstrained local delta; mostly doubles per-pixel work |
+| `tanh+freqsplit` | 84 k | band-separated detail with everything bounded; most conservative |
+
+Combining is only worth it when the members do genuinely different things.
+`perpixel` and `freqsplit` are both unconstrained per-pixel paths, so pairing
+them mostly just adds parameters without adding capability — which is why that
+combination is not offered.
+
+`lut3d` already contains a per-pixel conv, so "LUT + per-pixel" is already a
+head on its own.
+
+---
+
+## Full-resolution inference: tiling
+
+The whole-frame path letterboxes to the training size, so a 12-megapixel photo
+reaches the network at about 0.06× scale. Geometry survives; detail does not, and
+detail is precisely what the halation and high-frequency heads exist to supply.
+
+Tiling fixes the *scale* problem. Each tile is cut from the **original** image,
+processed at close to native resolution, and crossfaded back together:
+
+```text
+original frame
+  → overlapping tile_size boxes, each edge-replicated where it runs off-frame
+  → normal letterbox pipeline per tile  (so scale ≈ 1.0)
+  → accumulate patch × Hann window
+  → divide by accumulated window
+  → one image, same size as the input
+```
+
+Two details that matter:
+
+**Every tile is exactly `tile_size`.** Edge boxes deliberately extend past the
+frame and are edge-replicated. A partial edge tile would have a blend window
+approaching zero at the border, and since the result is `sum(w·pixel) / sum(w)`,
+a near-zero weight makes the divide numerically fragile.
+
+**The window has a positive floor, applied to numerator and denominator
+identically.** The separable form squares the per-axis floor, so the 2D window is
+clamped explicitly. Clamping only one side — as an earlier version did — scaled
+the result by the mismatch factor and turned all four image corners black.
+
+Verified seam-free: a linear gradient stays linear (mean error `0.10/255`), a
+5000-step checkerboard shows no spurious step, and all four corners round-trip
+exactly.
+
+Cost scales with tile count:
+
+| frame | tile 512 / overlap 128 | megapixels processed |
+|---|---:|---:|
+| 1920×1080 | 15 tiles | 3.9 MP |
+| 4032×3024 | 88 tiles | 23.1 MP |
+
+Two semantic caveats:
+
+- **`region-exposure` becomes tile-local.** Its 4×4 grid describes the tile, not
+  the photograph. Train without that capability if you need global regions.
+- **Halation near a tile border** is computed from a truncated highlight field, so
+  glow that should cross a boundary is weakened. The overlap hides most of it.
+
+The subject gate is computed per tile, which is usually *better* for a large
+subject.
+
+---
+
+No positional embeddings, no fixed spatial resolution, no resolution-dependent
+parameters:
+
+- normalisation is `GroupNorm` / `LayerNorm`, both per-channel
+- the effect head uses `AdaptiveAvgPool2d(1)`
+- the decoder upsamples with dynamic `F.interpolate` to each skip's size
+- attention windows are re-partitioned per input size
+
+Consequence: the model runs unmodified at 48×64, 96×128, or 600×800, and attention
+cost is **constant** regardless of input size. Verified at every one of those.
+
+What is *not* free is relative scale: a fixed-size receptive field covers a
+smaller fraction of a larger frame. `geometry.py` handles that at the boundary by
+letterboxing to the training shape, so the network never sees the shifted
+distribution unless you explicitly ask with `--fit native`.
+
+The procedural effects are aspect-corrected too. Vignette and light leak use
+coordinates normalised by **half the shorter side**, so a circle stays circular
+and a diagonal stays diagonal on any rectangle. Normalising each axis
+independently to `[-1, 1]` produced a vignette 33% stronger vertically than
+horizontally on a 3:4 frame; the measured anisotropy is now `0.000000`.
+
+---
 
 ## Losses
 
-The unpaired training objective combines:
+Unpaired, so the objective is adversarial plus constraints:
 
-```text
-PatchGAN adversarial loss
-content L1 and edge loss
-identity loss on target images
-batch-level RGB moment matching
-effect coefficient regularization
-```
+| loss | weight | job |
+|---|---|---|
+| PatchGAN | 1.0 | match the target *distribution* |
+| content + Sobel edge | 1.5 | stay close to the source |
+| identity on targets | 0.75 | already-styled images pass through unchanged |
+| batch RGB moments | 0.35 | coarse colour statistics, batch level, not paired |
+| effect L2 | 0.02 | stop coefficients saturating at 0/1 |
 
-There is no paired pixel target.
+The discriminator is the only loss that sees targets as targets. Everything else
+is a leash.
+
+---
 
 ## Core ML boundary
 
-The export wrapper returns:
-
-```text
-styled image
-optional effect coefficients
-```
-
-Core Image/Metal remains responsible for:
-
-```text
-grain
-light leaks
-bloom
-vignette
-overlays
-```
-
-This boundary makes the model easier to debug and lets you compare deterministic and stochastic outputs independently.
+The export wrapper returns the styled image plus optional effect coefficients.
+Core Image/Metal remains responsible for grain, light leaks, bloom, vignette and
+overlays. This boundary makes the model easy to debug and lets you compare
+deterministic and stochastic outputs independently.
