@@ -33,3 +33,11 @@ training_photos/**/*.webp
 .pytest_cache/
 .ruff_cache/
 .DS_Store
+
+# LaTeX intermediates (sources and PDFs are committed)
+docs/latex/*.log
+docs/latex/*.aux
+docs/latex/*.out
+docs/latex/*.toc
+docs/latex/*.fls
+docs/latex/*.fdb_latexmk

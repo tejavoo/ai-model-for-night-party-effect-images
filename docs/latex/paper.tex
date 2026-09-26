@@ -1,0 +1,529 @@
+% =====================================================================
+%  Night Flash Edge -- research paper
+%  Build:  tectonic -X compile paper.tex --outfmt pdf
+%         (or ../latex/build.sh paper, from docs/latex/)
+% =====================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=25mm]{geometry}
+\usepackage{amsmath,amssymb,booktabs,graphicx,longtable,array,enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr,titlesec,microtype}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\definecolor{codebg}{RGB}{247,247,249}
+\definecolor{rulegray}{RGB}{200,200,205}
+\definecolor{accent}{RGB}{30,60,110}
+
+\lstset{
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  rulecolor=\color{rulegray},
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+}
+
+\titleformat{\section}{\Large\bfseries\color{accent}}{\thesection}{0.7em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.6em}{}
+\titlespacing*{\section}{0pt}{14pt}{6pt}
+\titlespacing*{\subsection}{0pt}{10pt}{4pt}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\color{gray}Night Flash Edge}
+\fancyhead[R]{\small\color{gray}\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\flag}[1]{\texttt{--#1}}
+\newcommand{\method}{\textsc{Night Flash Edge}}
+
+\title{\vspace{-2.2cm}\textbf{Compact Unpaired Style Transfer for a}\\
+\large Disposable-Camera Aesthetic, with Synthesised Source Domains\\[6pt]
+\large and Held-Out Model Selection}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\vspace{-1.1cm}
+
+\begin{abstract}
+\noindent
+Learning a photographic aesthetic from a target domain alone is the binding
+constraint of unpaired image-to-image translation, and it is usually left
+unsolved. We present \method, a $4.02$ M-parameter generator that learns a
+disposable-camera / Night Flash aesthetic for a native mobile camera, subject to
+two hard requirements: real-time execution on device, and export to Core ML.
+
+We make three contributions. First, we identify and correct a systematic bias in
+the standard unpaired objective: when an $L_1$ content penalty is evaluated on a
+\emph{stochastic} output, it penalises the stochastic texture the model is being
+asked to produce. We measure the penalty at $1.9\times$ the magnitude of the
+entire learned residual, and show that separating the $L_1$ and edge halves across
+different images removes it. Second, we introduce a synthetic degradation pipeline
+that manufactures a source domain from the target photographs by simulating a
+non-flash camera, in two variants: one with exact correspondence, which admits
+supervised reconstruction and real quality metrics, and one without, which
+provably removes the inverse-mapping shortcut the first variant admits. Third, we
+supply a validation regime that makes model selection possible at all, using
+reproducible held-out strips, a per-epoch metric history, and best-checkpoint
+retention --- none of which a loss curve provides.
+
+We report measurements for every claim, including two places where measurement
+falsified our initial design claims, and report the resulting corrections.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% =====================================================================
+\section{Introduction}
+
+A mobile camera application typically ships a deterministic colour transform
+plus a finishing chain, and can render a fixed aesthetic reliably. What it cannot
+do is \emph{adapt}: choose how much flash falloff a given scene wants, how
+strongly to lift a shadow, where grain should sit. A learned filter can, provided
+it is small enough to run in real time and simple enough to export to a hardware
+accelerator.
+
+The obstacle is data. A photographic aesthetic is a property of lighting and film
+response, not of content, so the pairs one would want --- the same scene with and
+without the treatment --- do not exist. Training must therefore be unpaired, and
+unpaired training brings a specific difficulty that this work addresses directly:
+\emph{with only a target domain, there is no source domain to translate from}.
+
+Three questions structure the paper. \S\ref{sec:loss} asks whether the standard
+unpaired objective is correctly specified when the generator emits stochastic
+texture, and finds that it is not. \S\ref{sec:degrade} asks how a source domain
+can be manufactured when only a target exists. \S\ref{sec:val} asks how model
+selection is possible without paired validation data, which is the precondition
+for knowing whether any of the above worked.
+
+\paragraph{Contributions.}
+\begin{enumerate}[leftmargin=1.5em]
+  \item A measurement and correction of texture bias in the unpaired content
+        penalty (\S\ref{sec:loss}).
+  \item A nine-stage camera-degradation model for synthesising a source domain,
+        with a paired and an unpaired pairing scheme, and an analysis of what it
+        can and cannot achieve (\S\ref{sec:degrade}).
+  \item A held-out validation regime with deterministic reproduction,
+        per-image comparability, a metric history, and best-checkpoint
+        selection (\S\ref{sec:val}).
+  \item A released, tested implementation in which all $28$ architecture
+        $\times$ head combinations train, infer and convert to Core ML
+        (\S\ref{sec:impl}).
+\end{enumerate}
+
+% =====================================================================
+\section{Method}
+
+\subsection{Model}
+
+The generator predicts a bounded residual on the input:
+\begin{equation}
+  x_{\text{out}} = \operatorname{clamp}\!\left(x_{\text{in}} + \Delta_\theta(x_{\text{in}}), 0, 1\right),
+  \qquad \lVert\Delta_\theta\rVert_\infty \le \rho .
+  \label{eq:residual}
+\end{equation}
+
+Eq.~\eqref{eq:residual} is the load-bearing design decision. The only way to
+produce a pixel is to perturb a pixel that already exists, so faces, text and
+geometry are structurally protected rather than protected by a penalty term. It
+also fixes the failure direction: an under-trained model degrades to a
+near-identity filter, which is the correct behaviour for a camera filter.
+
+The trunk is a convolutional encoder/decoder with local-window self-attention
+(\code{EdgeViT}) and a single overlapping cross-attention stage (\code{HAT}) for
+global context, at $4.02$ M parameters. Three photometric capabilities --- halation,
+a subject gate, and per-region exposure --- are each gated by a
+zero-initialised mix scalar, so a fresh model is exactly the plain residual and
+each capability engages only once training motivates it.
+
+The head determines the permitted parameterisation. We use a frequency-split head
+by default, predicting low, mid and high bands separately, on the grounds that
+grain and halation are high-frequency phenomena that a per-pixel head
+represents poorly.
+
+\subsection{Objective}
+
+\begin{equation}
+  \mathcal{L}_G = \mathcal{L}_{\mathrm{adv}} + \lambda_c \mathcal{L}_{\mathrm{content}}
+  + \lambda_m \mathcal{L}_{\mathrm{moment}} + \lambda_i \mathcal{L}_{\mathrm{identity}}
+  + \lambda_e \mathcal{L}_{\mathrm{effect}},
+  \label{eq:obj}
+\end{equation}
+with $(\lambda_c, \lambda_m, \lambda_i, \lambda_e) = (1.5, 0.35, 0.75, 0.02)$ and a
+PatchGAN discriminator at unit weight. The discriminator is the only term that
+sees targets as targets; every other term is a constraint on the generator.
+
+% =====================================================================
+\section{A correction: texture bias in the content penalty}
+\label{sec:loss}
+
+\subsection{The observation}
+
+The generator emits a deterministic residual, which a seeded procedural stage
+then turns into a stochastic image by adding grain, leak, exposure, saturation
+and vignette. Let $x_{\text{det}}$ denote the pre-effect output and
+$x_{\text{styled}}$ the post-effect output.
+
+The content term is a convex combination of an $L_1$ half and a Sobel edge half.
+Both halves were originally evaluated on $x_{\text{styled}}$. Because $L_1$ is
+texture sensitive, this charges the output for the stochastic texture.
+
+\subsection{Measurement}
+
+We train a model on a small pool and measure both penalties directly. The
+predicate ``$L_1$ on the styled image'' and ``$L_1$ on the deterministic image''
+differ by construction, but the interesting quantity is the magnitude:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lr@{}}
+\toprule
+Quantity & Value \\
+\midrule
+$\mathrm{content}(x_{\text{det}}, x_{\text{src}})$ & 0.01451 \\
+$\mathrm{content}(x_{\text{styled}}, x_{\text{src}})$ & 0.04237 \\
+\textbf{Penalty incurred by the effects} & \textbf{$+0.02786$} \\
+\midrule
+$\lVert x_{\text{det}} - x_{\text{src}} \rVert_1$ & 0.00891 \\
+$\lVert x_{\text{styled}} - x_{\text{det}} \rVert_1$ & 0.01601 \\
+\bottomrule
+\end{tabular}
+\caption{The stochastic effects are charged roughly $1.9\times$ more by the
+content term than the entire learned residual is charged for the whole style
+transfer.}
+\label{tab:bias}
+\end{table}
+
+Table~\ref{tab:bias} is the whole argument. The adversarial term, at unit
+weight, asks for grain. The content term, at weight $1.5$, penalises it, by an
+amount nearly double to the residual's own contribution. The content term wins,
+and the model learns to suppress the very effects its own effect head exists to
+produce. This is the familiar failure where a squared or absolute error on a
+stochastic target averages the stochastic component away.
+
+\subsection{The correction}
+
+The two halves belong to different comparisons. $L_1$ is a texture statistic and
+must be evaluated where the texture is not stochastic; the Sobel edge response
+is a structure statistic, is indifferent to fine texture, and should be
+evaluated on the final image so that broken geometry is actually caught:
+
+\begin{equation}
+  \mathcal{L}_{\mathrm{content}}
+    = 0.65\, L_1\!\left(x_{\text{det}},\, x_{\text{src}}\right)
+    + 0.35\, \mathcal{E}\!\left(x_{\text{styled}},\, x_{\text{src}}\right).
+  \label{eq:content}
+\end{equation}
+
+Eq.~\eqref{eq:content} leaves the intent of the original term --- stay close to
+the source --- intact while removing the gradient that fights the texture.
+
+\paragraph{Consequence for comparability.} Grain and halation become visibly
+stronger, which is the intent, but any checkpoint trained under the previous
+balance is no longer comparable. We therefore version the objective
+(\code{LOSS\_VERSION}$=2$), record the version in every checkpoint and in
+\code{config.json}, and warn on resume when it differs, so that the two halves of
+a run are never silently pooled.
+
+\subsection{Related failure avoided in the supervised term}
+
+Where a correspondence exists, we add a reconstruction term. It is deliberately
+evaluated on $x_{\text{det}}$ for the same reason: an $L_1$ term pointed at a
+stochastic \emph{target} would average the target's own grain out of both sides.
+
+% =====================================================================
+\section{Synthesised source domains}
+\label{sec:degrade}
+
+\subsection{Motivation}
+
+Unpaired translation assumes a source domain. When only a target domain exists,
+one must be constructed, or the problem is not posed. The construction must be a
+plausible capture of the same scenes by a different camera, so that the learned
+map generalises to real photographs rather than to the construction's
+fingerprints.
+
+\subsection{Pipeline}
+
+We simulate a non-flash camera by undoing a capture pipeline, resampling first so
+that photometric operations act on clean pixels:
+
+\begin{center}
+\begin{tabular}{@{}cl@{}}
+\toprule
+\# & Stage \\
+\midrule
+1 & crop and small rotation, shared with the target \\
+2 & downscale then upscale --- removes grain and fine detail \\
+3 & Gaussian blur --- residual softening \\
+4 & contrast compression about mid-grey \\
+5 & black lift, $x \mapsto x + b(1-x)$, preserving white \\
+6 & exposure gain \\
+7 & white-balance shift, warmed \\
+8 & saturation increase \\
+9 & light sensor noise \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Stages 4--5 carry most of the shift. Compressing the tonal range is what removes
+the flash falloff signature --- the bright subject on dark ground --- and it is
+what makes the output read as an evenly-lit non-flash capture rather than merely
+a dark one.
+
+\subsection{Effect, measured}
+
+Averaged over eight draws on a real photograph:
+
+\begin{center}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Statistic & \code{subtle} & \code{moderate} & \code{strong} \\
+\midrule
+high-frequency energy (relative) & 0.52 & 0.30 & 0.21 \\
+tonal range $p_{99}-p_1$         & 0.75 & 0.57 & 0.49 \\
+warmth $R-B$                     & 0.040 & 0.078 & 0.121 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Two claims we had to retract}
+
+\paragraph{Resampling does not remove halation.} We initially documented the
+downscale/upscale stage as destroying halation bloom. A targeted probe refuted
+this. Halation is a wide, low-frequency phenomenon; a low-pass filter has nothing
+to remove, and blurring a glow makes it \emph{brighter} by spreading the core
+into the surrounding ring. On a probe with a specular point and a halo, the
+ring-to-peak luminance ratio rises from $0.57$ to $0.86$ as blur increases from
+$0$ to $4$. The pipeline attenuates halation, driven by tonal compression rather
+than filtering, which suffices for our purpose --- the model must learn to add
+glow where the target has it --- but would not suffice for constructing a source
+with provably zero halation. That would require re-rendering the illumination.
+
+\paragraph{Too-strong degradation is a defect.} A first \code{strong} preset used
+blur to $2.5$ and black lift to $0.20$. The output looked foggy rather than like a
+photograph, and its injected noise was conspicuous against the softened
+background. Training on such inputs teaches a model to expect a distribution that
+never occurs at inference, which is a worse outcome than a weaker domain shift.
+We pulled the ranges back until the strongest profile still reads as a believable
+overcast capture. Plausibility, not magnitude, is the design objective.
+
+\subsection{Two pairing schemes}
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Scheme & Source & Target & Correspondence \\
+\midrule
+\code{paired}  & $\mathrm{deg}(x_i)$ & $x_i$ & exact, same file \\
+\code{sameset} & $\mathrm{deg}(x_j),\ j \neq i$ & $x_i$ & none, one pool \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+In both, the shared geometric warp is applied to both images first and the
+degradation runs afterwards on the source only, so any crop, flip or rotation is
+common to the pair and only the simulated camera differs.
+
+\subsection{The inverse-mapping shortcut}
+
+The \code{paired} scheme admits a shortcut. Because the source is a deterministic
+function of the target, the network can reduce its loss by learning
+$\mathrm{deg}^{-1}$ rather than the aesthetic. It will score well on
+freshly-degraded inputs and fail on real photographs, and the failure is invisible
+unless sought.
+
+The \code{sameset} scheme removes the shortcut by construction: $x_i$ and $x_j$
+are unrelated photographs, so no pointwise relationship exists to invert and the
+model must learn the conditional distribution of the look. It also doubles the
+usable pairings, since every image serves as both source and target.
+
+The price is that without correspondence no supervised reconstruction is
+available and no real quality number can be computed, so only distribution-level
+metrics apply. We accept this asymmetry rather than pretending it away, and the
+practical recommendation is to run both schemes as parallel arms and let the
+evidence decide.
+
+\subsection{Variation across images, epochs and runs}
+
+Parameters are drawn per image; the dataset seeds its generator with the epoch
+index, so the draw also varies per epoch at no cost; and the run seed shifts the
+stream. Two further mechanisms are provided. An \emph{identity path}, taken with
+probability $0.10$, feeds the target through undegraded, anchoring the identity
+case and widening the input distribution. A \emph{curriculum}, on by default,
+ramps the profile \code{subtle} $\rightarrow$ \code{moderate} $\rightarrow$
+\code{strong}, giving early epochs an easy mapping and later epochs robustness.
+
+% =====================================================================
+\section{Held-out validation and model selection}
+\label{sec:val}
+
+\subsection{The problem}
+
+A discriminator loss is not a quality signal, and neither is a generator loss.
+Without a validation signal there is no basis for choosing between checkpoints, no
+basis for detecting overfitting, and no basis for deciding whether a
+hyperparameter change helped. In this setting the difficulty is sharper still,
+because the data is unpaired by construction.
+
+\subsection{Deterministic reproduction}
+
+Two independent properties must be pinned, and the second is unconditional.
+
+\emph{Which} images appear is set by \code{val\_select}; we default to
+\code{fixed}, because per-image progress is only legible if the same images
+recur, and because re-showing the same handful would otherwise hide a model that
+has memorised them.
+
+\emph{How} each image is degraded and seeded is always pinned, with seeds derived
+from the filename by SHA-256 rather than from the epoch-dependent random stream.
+This is not an optimisation. A validation image degraded with a fresh draw each
+epoch is a different problem each time, and any apparent improvement is noise.
+Python's built-in \code{hash()} is salted per interpreter and is therefore
+unusable for this purpose; cross-session stability requires a cryptographic
+digest.
+
+The resulting artefact is one strip image per epoch: one image per row, cells
+ordered input, output, target, so a given image's input and output are adjacent.
+The header carries the epoch, mode, active profile and aggregate metrics.
+
+\subsection{From measurement to selection}
+
+The strip is for a person; the CSV history is for the log. One row per epoch of
+PSNR, SSIM, $L_1$ and effect magnitude makes the curve plottable, and --- more
+importantly --- makes checkpoint selection possible. Before this, only
+\code{latest.pt} existed: a run peaking at epoch $40$ and decaying by epoch $60$
+had no way to recover its best weights. We now retain a \code{best.pt} on
+improvement and prune old per-epoch checkpoints, since $60$ epochs of a
+$17$ MB checkpoint is a gigabyte that also slows every snapshot.
+
+We write \code{best.pt} only in the \code{paired} scheme. In \code{sameset},
+PSNR compares two unrelated photographs, so ranking on it would be meaningless,
+and we decline to emit a checkpoint that appears authoritative but is not.
+
+\subsection{A shared-warp defect}
+
+The first implementation of the shared geometric warp sampled scale, rotation and
+flips once but drew the crop \emph{offset} from the shared random stream inside
+each application, so the source and target received different offsets. This is
+harmless for unpaired data, where the images are unrelated anyway, and it
+silently destroys the correspondence for paired data. We sample the offset once
+as a fraction and clamp it per image, so differently sized images still receive
+the same relative crop. We report it because the class of bug --- a
+correspondence silently destroyed by a shared mutable stream --- is easy to
+introduce and invisible without a test that asserts byte-identical outputs from
+identical inputs.
+
+% =====================================================================
+\section{Deployment}
+
+\subsection{Inference}
+
+Whole-frame inference is the default: the image is letterboxed, styled, and
+restored to its exact original dimensions, with no cropping and no stretching.
+We verify a landmark round trip at $0.0017$ worst positional error with output
+size identical to input.
+
+Tiled inference, for native-resolution detail, crossfades overlapping tiles under
+a raised-cosine window. The tile size must match the training crop; a mismatch is
+a distribution shift, and the implementation warns rather than blocks. Measured
+cost on a $4032\times3024$ source at $256$ px tiles is $336$ tiles and $22.0$ MP
+at $25\%$ overlap, rising to $713$ tiles and $46.7$ MP at $50\%$. The relevant
+quantity is the overlap \emph{ratio}, not its absolute value.
+
+Frame borders do not fade, which is the usual failure of naive windowed blending.
+The window carries a positive floor and edge tiles extend past the frame, so the
+frame border is never a tile border; a $255$-valued border strip survives at
+$254.6/255$ against a worst-case error of $1.0$.
+
+\subsection{Core ML}
+
+All $28$ architecture $\times$ head combinations convert, with tensor-I/O mean
+absolute error $0.00030$. Several choices exist solely to satisfy the export
+boundary and should not be refactored away: explicit attention matmuls in place
+of the fused multi-head operator, a flat $(s^3, 3)$ LUT table, explicit trilinear
+gathers in place of \code{grid\_sample}, and shape integers precomputed at
+construction because \code{torch.jit.trace} turns \code{x.shape[1]} into a
+zero-dimensional tensor that breaks pooling and \code{min}/\code{max}.
+
+\subsection{Training/inference gap}
+
+Synthesised source domains narrow the input distribution relative to arbitrary
+user photographs. We mitigate this on the training side --- wide randomisation,
+the identity path, and a strong profile --- and we explicitly reject
+inference-time input normalisation, which risks double-degrading a user image.
+
+% =====================================================================
+\section{Implementation and verification}
+\label{sec:impl}
+
+$264$ tests pass. Beyond shape and conversion checks, the suite pins the
+behaviours that would otherwise fail silently: the content-loss split, including
+that the $L_1$ half is insensitive to the styled image and the edge half is not;
+that a shared warp yields byte-identical source and target from identical inputs;
+that validation degradation is invariant across epochs while training degradation
+is not; that the \code{sameset} scheme never pairs an image with itself and
+degrades gracefully on a single-image pool; that \code{best.pt} is not written
+without a correspondence; and an abstract-syntax check that no module unpacks a
+generator call without the architecture-agnostic helper, a defect that had already
+shipped once in the evaluation entry point.
+
+\section{Conclusion}
+
+The most consequential finding here is unglamorous: a standard loss term, applied
+in a plausible place, silently cancelled the component of the model it was
+supposed to support. It was found only by measuring the penalty each stage
+incurits rather than by inspecting the loss curve, which continued to fall. The
+second is that a validation regime is a prerequisite for knowing whether anything
+worked, and that without a correspondence it must be built from
+distributional evidence instead of reconstruction metrics. Both are, we think,
+general lessons for small unpaired systems rather than facts about this
+particular aesthetic.
+
+\paragraph{Limitations.} The degradation model attenuates rather than eliminates
+halation, and the strongest profile is a judgement call about plausibility. The
+\method{} aesthetic is narrow by construction; multiple distinct looks would
+require separate checkpoints or a style embedding. Unpaired training cannot
+guarantee identity preservation, and the held-out metrics reported here are
+quality proxies rather than perceptual ground truth.
+
+% =====================================================================
+\appendix
+\section{Reproduction}
+
+\begin{lstlisting}
+# train, paired scheme, strip and best.pt every epoch
+nf train --target-dir POOL --name a --epochs 60 --val-count 8
+
+# the same pool with the inverse-mapping shortcut removed
+nf train --target-dir POOL --name b --epochs 60 --train-mode sameset
+
+# stronger degradation, no curriculum, EMA for flicker
+nf train --target-dir POOL --name c --degrade-profile strong \
+  --no-degrade-curriculum --ema-decay 0.999
+
+# per-stage bounds, overriding the profile
+nf train --target-dir POOL --name d --degrade-contrast-min 0.3 \
+  --degrade-contrast-max 0.4 --degrade-resize-min 0.4
+\end{lstlisting}
+
+\begin{lstlisting}
+# whole frame, exact original size (default)
+s.infer("photo.jpg")
+
+# tiled; match tile to image_size
+s.infer("photo.jpg", tile=256, tile_overlap=64)
+
+# downscale the long edge, aspect preserved, then tile
+s.infer("12mp.jpg", max_edge=1024, tile=256)
+\end{lstlisting}
+
+\end{document}
