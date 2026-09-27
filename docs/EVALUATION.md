@@ -2,6 +2,65 @@
 
 Unpaired training requires more than one metric. A model can match target color statistics while destroying the subject.
 
+## Held-out validation during training
+
+`paired` and `sameset` hold out part of the target pool and score it every epoch.
+This is a different mechanism from `nightflash.evaluate`: it runs automatically,
+writes a strip you look at, and feeds checkpoint selection.
+
+```bash
+nf train --target-dir POOL --epochs 60 --val-every 1 --val-count 8
+```
+
+```
+runs/<name>/validations/
+  epoch-0007.png   input | output | target, one image per row
+  latest.png       a copy, for quick viewing
+  history.csv      epoch,images,psnr,ssim,l1,effect
+```
+
+Read the strip, not the loss curve. The discriminator loss is not a quality
+signal and will fall while the output gets worse.
+
+### What each number means
+
+| column | meaning | trustworthy in |
+|---|---|---|
+| `psnr` | peak signal-to-noise ratio of the deterministic output against the true target | `paired` only |
+| `ssim` | structural similarity, same comparison | `paired` only |
+| `l1` | mean absolute difference, same comparison | `paired` only |
+| `effect` | mean magnitude of the degradation parameters in the batch | all modes |
+
+In `sameset` the target is a *different* photograph, so `psnr`, `ssim` and `l1`
+are computed between unrelated images and mean nothing as quality measures. They
+are still recorded so the columns line up across arms, but **do not rank
+checkpoints on them** — which is why `best.pt` is not written in `sameset`.
+
+For `sameset`, the strip is the evaluation. Read it, and use distribution-level
+metrics if you need a number.
+
+### Two determinisms
+
+- `--val-select fixed` (default) keeps the same images every epoch, so per-image
+  progress is readable. `random` answers "is the model still healthy on
+  *arbitrary* images", which is what you want when you suspect memorisation.
+- The degradation and effect seeds are pinned per image via SHA-256 of the
+  filename, unconditionally. Without this, epoch 7 and epoch 8 would be different
+  problems and any improvement would be noise.
+
+### Model selection
+
+`best.pt` is written whenever validation PSNR improves, and `--keep-last` prunes
+old per-epoch checkpoints.
+
+This exists because the alternative is unrecoverable: with only `latest.pt`, a run
+that peaks at epoch 40 and decays by 60 has already thrown away its best weights.
+
+**Export `best.pt`, not `latest.pt`**, unless the history shows PSNR still rising
+at the final epoch.
+
+---
+
 ## Built-in diagnostics
 
 Run:

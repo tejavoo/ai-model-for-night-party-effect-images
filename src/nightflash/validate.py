@@ -177,7 +177,12 @@ def column_key_legend(columns: int) -> str:
 def evaluate_batch(
     batch: dict[str, Any], styled: torch.Tensor, deterministic: torch.Tensor
 ) -> ValidationMetrics:
-    """Score a validation batch against its ground-truth targets."""
+    """Score a validation batch against its ground-truth targets.
+
+    ``batch`` must already carry device-resident ``target`` and
+    ``degrade_params``; passing the raw CPU batch alongside a model output on
+    MPS or CUDA raises a device mismatch.
+    """
 
     target = batch["target"]
     n = target.shape[0]

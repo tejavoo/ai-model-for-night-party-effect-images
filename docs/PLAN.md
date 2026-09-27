@@ -253,3 +253,45 @@ Small hybrid residual model
 ```
 
 This gives you a small learned model without the cost and unpredictability of a full diffusion pipeline.
+
+---
+
+## Decision record: synthesised source domains
+
+Added after the initial build, because the original plan assumed a source domain
+would exist. It usually does not, for a photographic aesthetic.
+
+**Problem.** Unpaired translation is defined between two domains. With only a
+target domain, the problem is not posed, and scraping for a matching source
+domain is slow, inconsistently licensed, and rarely converges.
+
+**Decision.** Manufacture the source by simulating a non-flash capture of the
+target photographs, in two pairing schemes.
+
+| scheme | why it exists |
+|---|---|
+| `paired` | Exact correspondence. Enables supervised reconstruction and real PSNR/SSIM validation. |
+| `sameset` | Removes the shortcut `paired` admits: with no pointwise correspondence, the model cannot learn to invert the degradation. |
+
+**Rejected alternatives, and why:**
+
+| alternative | reason for rejection |
+|---|---|
+| Perceptual (LPIPS/VGG) loss | VGG16 is ~528 MB and would either ship inside the `.mlpackage` or be forced into the traced graph, breaking the 4M-parameter real-time goal. A distilled feature extractor is the only compatible version. |
+| Inference-time input normalisation | Risks double-degrading a user image. Training-side widening of the input distribution reaches the same end without inference cost. |
+| Diffusion / score matching | Wrong class of model for a 4M-parameter real-time filter, and incompatible with the Core ML target. |
+| A stronger degradation profile | Measured, then pulled back. A source that looks foggy rather than photographic teaches a model to expect a distribution that never occurs at inference. |
+
+**Accompanying correction.** The content loss was evaluated entirely on the
+post-effect image, so its L1 half charged the output for the stochastic texture it
+was meant to support. Measured penalty: +0.02786 against a residual deviation of
+0.01451, roughly 1.9×. Splitting the L1 and edge halves across different images
+fixes it. `LOSS_VERSION` is now 2 and is checked on resume.
+
+**Accompanying infrastructure.** Held-out validation strips, a per-epoch metric
+history, and best-checkpoint retention. Before this, only `latest.pt` existed, so
+a run that peaked early and decayed had no way to recover its best weights.
+
+**Open question.** Whether `paired` or `sameset` wins is an empirical question
+that this repository does not answer. Run both as parallel arms and compare the
+validation strips.

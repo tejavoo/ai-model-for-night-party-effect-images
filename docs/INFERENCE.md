@@ -253,6 +253,33 @@ s.infer("huge/", max_edge=2048, seeds=2)
 It never upscales: `max_edge=4096` on a 300×200 photo returns 300×200. Aspect
 ratio is preserved to within 0.005 on the sizes that matter.
 
+### The training/inference input gap
+
+`paired` and `sameset` training narrow the **input** distribution to degraded
+night photographs. That makes learning easier, but a real user photograph is
+brighter and sharper than anything the model saw during training.
+
+Three mitigations are in place, in order of importance:
+
+1. **wide per-image randomisation** of every degradation parameter, so the input
+   distribution is broad rather than a narrow band;
+2. **the identity path** (`--degrade-none-prob`, default 0.10), which feeds clean
+   targets as sources and anchors the identity case;
+3. **`--degrade-profile strong`**, which widens the degraded range far enough to
+   reach ordinary-photo territory.
+
+An inference-time input normalisation — normalising a user photo to match the
+training statistics — was considered and **rejected**. It risks double-degrading
+an image that was already close, and the training-side mitigations reach the same
+end without inference cost or risk.
+
+**How to tell if you have a problem:** compare the output on a *freshly degraded*
+validation image against the output on an ordinary photograph. If the first looks
+right and the second does not, the model learned the inverse of your degradation
+rather than the aesthetic. `sameset` exists to prevent exactly this, and the
+validation strip makes it visible within a few epochs. See
+[`TRAINING.md`](TRAINING.md#choosing-between-paired-and-sameset).
+
 ### What tiling changes semantically
 
 - **`region-exposure` becomes tile-local.** Its 4×4 grid now describes a tile, not

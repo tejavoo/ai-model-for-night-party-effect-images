@@ -945,7 +945,13 @@ class Session:
                     seed=self.val_config["seed"] + epoch,
                     strength=self.effects_strength,
                 )
-                totals.append(evaluate_batch(batch, styled, deterministic))
+                totals.append(evaluate_batch(
+                    # Rebind to the device copies: the raw batch is still on CPU
+                    # while the model output is not, and mixing them raises on
+                    # any non-CPU device.
+                    {"target": target, "degrade_params": batch.get("degrade_params")},
+                    styled, deterministic,
+                ))
                 paths = batch.get("target_path", [])
                 for i in range(source.shape[0]):
                     name = Path(paths[i]).name if i < len(paths) else f"{i}"

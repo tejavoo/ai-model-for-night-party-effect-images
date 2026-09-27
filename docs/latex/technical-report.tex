@@ -271,17 +271,17 @@ for the grain. Measured on a trained model:
 \toprule
 Quantity & Value \\
 \midrule
-$\mathrm{content}\!\left(x_{\text{det}}, x_{\text{src}}\right)$ & 0.01451 \\
-$\mathrm{content}\!\left(x_{\text{styled}}, x_{\text{src}}\right)$ & 0.04237 \\
-\textbf{Penalty the stochastic effects incur} & \textbf{$+0.02786$} \\
+$\mathrm{content}\!\left(x_{\text{det}}, x_{\text{src}}\right)$ & 0.02271 \\
+$\mathrm{content}\!\left(x_{\text{styled}}, x_{\text{src}}\right)$ & 0.04565 \\
+\textbf{Penalty the stochastic effects incur} & \textbf{$+0.02294$} \\
 \midrule
-$\lVert x_{\text{det}} - x_{\text{src}}\rVert_1$ & 0.00891 \\
-$\lVert x_{\text{styled}} - x_{\text{det}}\rVert_1$ & 0.01601 \\
+$\lVert x_{\text{det}} - x_{\text{src}}\rVert_1$ & 0.01233 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-The effects were being charged roughly \emph{1.9 times} more than the entire
+The robust claim is the ratio, not the absolute values, which are run-specific.
+The effects were charged \emph{1.86 times} more than the entire
 learned residual was charged for performing the whole style transfer. With the
 adversarial term at weight $1.0$ asking for grain and the content term at weight
 $1.5$ penalising it, the content term simply won, and the model learned to
@@ -368,7 +368,7 @@ On a real photograph, averaged over eight draws per profile:
  & \code{subtle} & \code{moderate} & \code{strong} \\
 \midrule
 high-frequency energy (relative) & 0.52 & 0.30 & 0.21 \\
-tonal range $p_{99}-p_1$         & 0.75 & 0.57 & 0.49 \\
+tonal range $p_{99}-p_1$         & 0.76 & 0.62 & 0.58 \\
 saturation (absolute)            & 0.04 & 0.08 & 0.12 \\
 warmth $R-B$ (absolute)          & 0.040 & 0.078 & 0.121 \\
 \bottomrule

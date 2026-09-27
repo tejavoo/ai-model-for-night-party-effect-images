@@ -190,6 +190,56 @@ off by default (`0`) and never fails training — a snapshot error prints a
 warning and the run continues, because losing an hour of training to a network
 error would be a bad trade.
 
+### Training-mode flags
+
+`nf train` only. `--source-dir` / `--target-dir` are required only for
+`--train-mode unpaired`.
+
+```
+--train-mode unpaired|paired|sameset    omit to let the arguments decide
+--degrade-profile subtle|moderate|strong
+--degrade-none-prob F                   identity path (default 0.10)
+--no-degrade-curriculum                 do not ramp across training
+--degrade-config PATH                   JSON overrides, applied over the profile
+--degrade-<stage>-min / --degrade-<stage>-max
+--paired-weight F
+```
+
+`<stage>` is one of `exposure`, `black-lift`, `contrast`, `saturation`, `wb`,
+`resize`, `blur`, `noise`.
+
+### Validation flags
+
+`nf train` only. The strip is written to `runs/<name>/validations/`.
+
+```
+--val-every N                  default 1; 0 disables
+--val-count N                  default 8
+--val-select fixed|random      default fixed
+--val-cols 2|3                 default 3 (input|output|target)
+--val-split F                  default 0.15
+--val-holdout-dir PATH         explicit held-out directory, overrides --val-split
+--val-seed N                   default 0
+--val-layout rows|cols         default rows
+```
+
+### Checkpoint flags
+
+```
+--no-keep-best                 do not write checkpoints/best.pt
+--keep-last N                  default 3
+--ema-decay F                  default 0.0, i.e. off
+```
+
+`--val-holdout-dir` is deliberately a different flag from `--val-dir`.
+`--val-dir` predates the validation work, is recorded in `config.json`, and is
+still not consumed by the training loop; repurposing its name would have made old
+config files mean something different.
+
+`--degrade-none-prob` and `--no-degrade-curriculum` default to *unset* rather than
+to their values, so that a `--degrade-config` file's value is not silently
+overwritten by a flag default. An explicitly passed flag still wins.
+
 Examples:
 
 ```bash

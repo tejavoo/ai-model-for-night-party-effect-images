@@ -21,15 +21,22 @@ The app already has a deterministic Core ML color transform plus Core Image/Visi
 - Seeded procedural grain, leak, exposure, saturation, and vignette renderer
 - Unpaired PatchGAN training with content, identity, edge, and batch-statistics
   losses
+- **Two synthetic-degradation training modes** that manufacture a source domain
+  from the target pool, in a paired and a shortcut-free variant
 - Geometric augmentation with a shared warp across source, target and mask
 - Mid-training preview generation
-- Checkpoint/resume, plus Kaggle snapshot/restore for cross-session survival
+- **Held-out validation strips, a per-epoch metric history, and best-checkpoint
+  selection**
+- Checkpoint/resume, EMA, retention policy, plus Kaggle snapshot/restore for
+  cross-session survival
 - Whole-frame, tiled, and downscale-then-tiled inference
 - Evaluation diagnostics
 - Core ML export to `.mlpackage` and `.mlmodel`, with a PyTorch-vs-Core-ML
   validator
 - Optional Textual terminal UI
 - Colab, Kaggle, and local documentation
+- A LaTeX technical report and research paper with built PDFs, in
+  [`docs/latex/`](docs/latex/)
 
 ## Design decision
 
@@ -132,6 +139,20 @@ anything new.
 12. [`docs/EVALUATION.md`](docs/EVALUATION.md) — quality and performance evaluation
 13. [`docs/COREML.md`](docs/COREML.md) — Core ML export and iOS integration
 14. [`docs/TUI.md`](docs/TUI.md) — the optional terminal UI
+15. [`docs/latex/`](docs/latex/) — **technical report and research paper**, with built PDFs
+
+### Long-form documents
+
+Two PDFs cover the whole system, including the measurements behind each decision:
+
+- [`docs/latex/technical-report.pdf`](docs/latex/technical-report.pdf) — the
+  reference: architecture, the objective and its correction, the degradation
+  pipeline, all three training modes, validation, inference, Core ML.
+- [`docs/latex/paper.pdf`](docs/latex/paper.pdf) — the same work framed as a
+  research argument, including the two claims that measurement falsified.
+
+Rebuild with `cd docs/latex && ./build.sh` (needs
+[`tectonic`](https://github.com/tectonic-typesetting/tectonic)).
 
 ## Quick start: one object
 
@@ -207,11 +228,89 @@ scalar so a fresh model starts as a no-op:
 The zero-init gate is what makes them safe to enable by default: the model
 cannot regress on a capability it has not yet learned to use.
 
+## Training modes
+
+When you have a target domain but no matching source domain — the usual case for
+a photographic aesthetic — the source can be **manufactured** by simulating what
+the same scene would have looked like through a non-flash camera.
+
+| `--train-mode` | source | target | correspondence |
+|---|---|---|---|
+| `paired` *(default for one pool)* | `degrade(image_i)` | `image_i` | exact, same file |
+| `sameset` | `degrade(image_j)`, `j ≠ i` | `image_i` | none, same directory |
+| `unpaired` | `--source-dir` | `--target-dir` | none, two pools |
+
+Leave `--train-mode` off and it resolves from the arguments: one pool gives
+`paired`, two distinct pools give `unpaired`. An explicit mode is always honoured
+and rejected loudly if it cannot work.
+
+### The degradation pipeline
+
+Nine stages, run in the order a camera pipeline would be *undone*:
+
+| # | stage | what it does |
+|---|---|---|
+| 1 | crop + rotate | geometric normalisation, **shared with the target** |
+| 2 | downscale → upscale | removes grain and fine detail |
+| 3 | blur | residual softening |
+| 4 | contrast ↓ | **flattens the flash falloff signature** |
+| 5 | black lift | removes crushed shadows |
+| 6 | exposure ↓ | overall gain |
+| 7 | white balance ↑ | flash is neutral, ambient is tungsten |
+| 8 | saturation ↑ | flash photos only *look* desaturated because of the WB mismatch |
+| 9 | sensor noise | so the model doesn't assume a pristine input |
+
+Measured on a real photograph, relative to the clean target:
+
+| | `subtle` | `moderate` | `strong` |
+|---|---:|---:|---:|
+| high-frequency energy | 0.52 | 0.30 | 0.21 |
+| tonal range | 0.76 | 0.62 | 0.58 |
+
+The profile **ramps automatically** from `subtle` to `strong` across training
+(`--no-degrade-curriculum` to disable). An identity path fires with probability
+`0.10`, passing the target through undegraded.
+
+### Why `sameset` exists
+
+`paired` has a shortcut available: learn to invert *your specific* corruption. The
+model then looks excellent on freshly-degraded images and poor on real ones, and
+the failure is invisible unless you look for it.
+
+`sameset` removes that shortcut by construction — `image_i` and `image_j` are
+unrelated, so there is nothing to invert. The cost is that without a
+correspondence there is no real quality number, so **no `best.pt` is written**
+(PSNR would be comparing two unrelated photos).
+
+Run both as parallel arms on your two GPUs and let the evidence decide.
+
+## Validation
+
+One strip per epoch, one image per row, cells ordered `input | output | target`,
+with the aggregate metrics printed into the header. A CSV history accumulates
+alongside it.
+
+```
+runs/edgehat_freqsplit_night/validations/
+  epoch-0007.png   latest.png   history.csv
+```
+
+`best.pt` is written whenever validation PSNR improves, and `--keep-last` prunes
+old checkpoints. Before this, only `latest.pt` existed — so a run that peaked at
+epoch 40 and decayed by 60 had no way to recover the good weights.
+
+Two determinisms make the strips comparable: `--val-select fixed` (the default)
+keeps the same images every epoch, and the degradation and effect seeds are
+derived from the filename via SHA-256 so a strip rendered this week matches one
+rendered last month. Validation images are split out of the pool by scene and
+never trained on.
+
 ## Augmentation
 
 One geometric warp per item, applied **identically to the source, the target and
-the mask** — otherwise an unpaired batch describes two different scenes and the
-content losses contradict each other.
+the mask** — including the crop offset, which is sampled once as a fraction.
+Otherwise an unpaired batch describes two different scenes and the content losses
+contradict each other, and a paired batch loses its correspondence entirely.
 
 ```bash
 --augment default        # scale 0.8-1.25, rot +/-12deg, hflip + vflip
@@ -255,9 +354,26 @@ Full reference in [`docs/INFERENCE.md`](docs/INFERENCE.md).
 ### Training
 
 ```bash
-# Two arms on two GPUs, in two notebook copies
-nf train --source-dir ... --target-dir ... --name a --arch edgehat --epochs 60
-nf train --source-dir ... --target-dir ... --name b --arch swinir  --epochs 60
+# The default: paired, source synthesised by degrading the target pool
+nf train --target-dir POOL --name a --epochs 60
+
+# The shortcut-free variant, on your second GPU
+nf train --target-dir POOL --name b --epochs 60 --train-mode sameset
+
+# Two architectures, two GPUs, two notebook copies
+nf train --target-dir POOL --name a --arch edgehat --epochs 60
+nf train --target-dir POOL --name b --arch swinir  --epochs 60
+
+# Train across two separate pools instead (the old behaviour)
+nf train --source-dir SRC --target-dir TGT --name c --epochs 60
+
+# Stronger degradation, no curriculum, EMA to cut flicker
+nf train --target-dir POOL --name d --degrade-profile strong \
+  --no-degrade-curriculum --ema-decay 0.999
+
+# Override individual degradation bounds
+nf train --target-dir POOL --name e --degrade-contrast-min 0.3 \
+  --degrade-contrast-max 0.4 --degrade-resize-min 0.4
 
 # Isolate a capability's effect
 nf train ... --no-halation
@@ -270,10 +386,6 @@ nf train ... --epochs 60 --snapshot-every 1
 python scripts/warm_start.py \
   --checkpoint runs/conv-pilot/checkpoints/latest.pt \
   --output-dir  runs/hybrid-warm
-
-# Change resolution on an existing checkpoint (safe at any size)
-nightflash-train ... --image-size 512 --batch-size 4 \
-  --resume runs/hybrid/checkpoints/latest.pt
 ```
 
 ### Export
@@ -323,6 +435,7 @@ Package the code for upload (datasets, runs and checkpoints are excluded):
 
 ```bash
 ./scripts/make_colab_bundle.sh     # → dist/nightflash-edge-colab.zip
+./scripts/make_kaggle_bundle.sh    # → dist/nightflash-edge-kaggle.zip
 ```
 
 The official Colab CLI (`pip install google-colab-cli`) and Colab MCP

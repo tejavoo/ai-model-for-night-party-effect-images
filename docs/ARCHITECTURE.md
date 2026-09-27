@@ -243,6 +243,32 @@ These weights are fixed and are not exposed on `nf` / `Session`. `nightflash-tra
 has flags for them if you need to experiment; see
 [`TRAINING.md`](TRAINING.md#loss-weights-are-nightflash-train-only).
 
+### Where the texture penalty belongs
+
+`content_loss` evaluates its two halves against **different** images:
+
+```text
+L_content = 0.65 * L1(x_det,    source)      # texture statistic -> pre-effect
+          + 0.35 * edge(x_styled, source)   # structure statistic -> final image
+```
+
+Evaluating both on the post-effect image — as an earlier version did — charges the
+output for the stochastic texture, because L1 is texture sensitive. Measured on a
+trained model, the stochastic effects incurred a content penalty of **+0.02294**
+against a deterministic-residual deviation of **0.01233**: they were being charged
+**1.86×** more than the entire learned residual was charged for the whole style
+transfer. With the adversarial term at weight 1.0 asking for grain and the content
+term at 1.5 penalising it, the content term won and the model learned to suppress
+the grain and halation its own effect head exists to produce.
+
+The supervised reconstruction term is evaluated on `x_det` for the same reason: an
+L1 term pointed at a stochastic *target* would average the target's own grain out
+of both sides.
+
+`LOSS_VERSION` is 2. It is written into `config.json` and every checkpoint, and a
+resume whose recorded version differs warns, so the two halves of a run are never
+silently compared.
+
 ---
 
 ## Data pipeline
@@ -269,6 +295,14 @@ files, so nothing forces their crops to correspond. Applying different warps
 would hand the discriminator two unrelated scenes and pull the content losses in
 contradictory directions — a silent, plausible-looking degradation with no error.
 
+The **crop offset** is part of the warp, not a separate draw. An earlier version
+read it from the shared random stream inside each application, so the two images
+received different offsets: harmless for unpaired data, and quietly destructive
+for `paired` mode, where it destroys the correspondence the whole scheme exists
+to provide. The offset is now sampled once as a fraction and clamped per image,
+so differently sized images still receive the same relative crop. Verified: an
+identical input image yields byte-identical source and target in 60 of 60 trials.
+
 ### Guarantees
 
 - every sample is exactly `image_size`², including a source smaller than the
@@ -277,12 +311,43 @@ contradictory directions — a silent, plausible-looking degradation with no err
 - the mask uses nearest-neighbour and a 0 fill, so it stays binary and a rotated
   corner cannot invent a person;
 - the rotate fill colour is identical for source and target;
+- the crop offset is shared, not merely the scale, rotation and flips;
 - target colour jitter is off unless explicitly enabled — the target carries the
   style signal, and perturbing it teaches a fuzzy look.
 
 Keeping every sample at a fixed native crop resolution is also what lets the same
 number be used for `--tile` at inference. Knob-by-knob rationale and the presets
 are in [`TRAINING.md`](TRAINING.md#augmentation).
+
+---
+
+## Synthetic degradation
+
+`src/nightflash/degrade.py`. When only a target domain exists, the source is
+manufactured by simulating a non-flash capture of the same scene.
+
+The nine stages run in the order a camera pipeline would be *undone* — crop,
+downscale/upscale, blur, contrast, black lift, exposure, white balance,
+saturation, noise — with resampling first so the photometric stages act on clean
+pixels. Stages 4 and 5 carry most of the domain shift: compressing the tonal
+range is what removes the flash falloff signature.
+
+Two things it deliberately does **not** do: move a highlight relative to its
+surroundings (halation placement is the thing being learned), or produce an
+implausible image (an input distribution that never occurs at inference is worse
+than a weaker domain shift).
+
+Two properties worth recording, both established by measurement rather than
+argument:
+
+- **Resampling cannot remove a wide halo.** Halation is low-frequency, and
+  blurring a glow makes it brighter by spreading the core into the ring. The
+  pipeline attenuates rather than erases, driven by tonal compression.
+- **The strongest profile is a judgement call about plausibility, not magnitude.**
+  An earlier `strong` looked foggy rather than photographic and was pulled back.
+
+Full parameter tables and the two training modes are in
+[`TRAINING.md`](TRAINING.md#synthetic-degradation).
 
 ---
 

@@ -2,12 +2,14 @@
 
 Everything needed to go from a fresh Kaggle notebook to a Core ML model, with
 the reasoning behind each choice. For the notebook itself see
-`notebook/nightflash_kaggle.ipynb` (6 cells, cells 3-6 identical to Colab).
+`notebook/nightflash_kaggle.ipynb` (7 cells).
 
 - [The 30-second version](#the-30-second-version)
 - [Before you start: the target domain](#before-you-start-the-target-domain)
 - [Session 1: set up](#session-1-set-up)
 - [Session 1: train](#session-1-train)
+- [Which mode?](#which-mode)
+- [Validation strips](#validation-strips)
 - [Session 2: resume](#session-2-resume)
 - [Inference](#inference)
 - [Using both GPUs](#using-both-gpus)
@@ -29,34 +31,44 @@ Cells 1-2 are setup and are identical every session. Cells 3-6 are the work.
 from nightflash import Session, brief
 
 # cell 2  (once per session)
+TRAIN_MODE = "paired"           # "paired" | "sameset" | "unpaired"
 s = Session(
-    source_dir="/kaggle/input/nightflash-data/normal_photos",
+    train_mode=TRAIN_MODE,
+    source_dir="/kaggle/input/nightflash-data/normal_photos" if TRAIN_MODE == "unpaired" else None,
     target_dir="/kaggle/input/nightflash-data/disposable_photos",
     runs_root="/kaggle/working/runs",
     arch="edgehat", head="freqsplit",
     image_size=256, batch_size=8, epochs=60,
     device="cuda",
-    snapshot_every=1,           # publish a Dataset version every epoch
+    degrade_profile="moderate",  # the source is synthesised by degrading the pool
+    val_count=8,                # held-out strip every epoch
+    snapshot_every=1,            # publish a Dataset version every epoch
 )
 s.auto_resume()                 # pull in the last snapshot, or start fresh
-print(brief(s))                 # read this before training
+print(brief(s, mode="train"))   # read this before training
 
 # cell 3  train
 s.train(extra_epochs=20)
 
 # cell 4  look at the output
 s.infer("/kaggle/input/nightflash-data/normal_photos", seeds=2, save_comparison=True)
+# runs/<name>/validations/epoch-0020.png   input | output | target
+# runs/<name>/validations/history.csv      psnr / ssim / l1 per epoch
 
-# cell 5  export
-!python -m nightflash.export_coreml --checkpoint {s.latest} --output /kaggle/working/model.mlpackage
+# cell 5  export the BEST checkpoint, not latest.pt
+!python -m nightflash.export_coreml \
+    --checkpoint {s.checkpoint_dir / "best.pt"} \
+    --output /kaggle/working/model.mlpackage
 
 # cell 6  final snapshot
 s.snapshot(note="done")
 ```
 
-`snapshot_every=1` is the part that matters most on Kaggle. `/kaggle/working` is
-wiped when the session ends, so without it a disconnect at epoch 41 out of 60
-throws away 41 epochs. With it you lose at most one epoch.
+Two settings matter most on Kaggle. `snapshot_every=1`, because `/kaggle/working`
+is wiped when the session ends — without it a disconnect at epoch 41 of 60 throws
+away 41 epochs, with it you lose at most one. And export `best.pt` rather than
+`latest.pt`, because a run that peaks early and decays has already overwritten
+its good weights in `latest.pt`.
 
 ---
 
@@ -118,6 +130,21 @@ Attach it in the notebook's **Add Data** panel, right-hand side, as *Input*.
 
 Either attach the bundle as a second dataset, or paste the install cell:
 
+```bash
+# On your Mac, build the bundle:
+./scripts/make_kaggle_bundle.sh    # → dist/nightflash-edge-kaggle.zip
+```
+
+Upload `nightflash-edge-kaggle.zip` as a Kaggle Dataset, attach it in the
+**Add Data** panel, then unzip it in the notebook:
+
+```python
+!unzip -q /kaggle/input/<your-bundle-dataset>/nightflash-edge-kaggle.zip \
+    -d /kaggle/working/nightflash-edge
+```
+
+Or install directly from the uploaded repo:
+
 ```python
 !pip install -q pyyaml pillow numpy torch torchvision kaggle
 !pip install -q -e .          # if you uploaded the repo
@@ -159,10 +186,15 @@ Get the key from **Kaggle → Settings → API → Create New Token**. Without t
 ## Session 1: train
 
 ```python
-from nightflash import Session
+from nightflash import Session, brief
+
+# Pick a mode. paired and sameset build the source by degrading TARGET_DIR,
+# so SOURCE_DIR is not used in those modes.
+TRAIN_MODE = "paired"     # "paired" | "sameset" | "unpaired"
 
 s = Session(
-    source_dir="/kaggle/input/nightflash-data/normal_photos",
+    train_mode=TRAIN_MODE,
+    source_dir="/kaggle/input/nightflash-data/normal_photos" if TRAIN_MODE == "unpaired" else None,
     target_dir="/kaggle/input/nightflash-data/disposable_photos",
     runs_root="/kaggle/working/runs",
     arch="edgehat",
@@ -172,10 +204,14 @@ s = Session(
     epochs=60,               # ABSOLUTE target epoch
     device="cuda",
     augment_preset="default",
+    degrade_profile="moderate",
+    val_count=8,             # images per validation strip
+    val_select="fixed",      # same photos every epoch
+    keep_last=3,
     snapshot_every=1,
 )
 s.auto_resume()
-brief_and_print(s)
+print(brief(s, mode="train"))
 s.train(extra_epochs=20)
 ```
 
@@ -185,6 +221,44 @@ no-op "continue" — if there is nothing to do it says so and gives you the
 command that would actually do something.
 
 `brief(s)` returns the text; `print()` it. `nf brief` prints it too.
+
+### Which mode?
+
+| mode | what it does | when |
+|---|---|---|
+| `paired` | source = `degrade(image_i)`, target = `image_i` | you want real PSNR/SSIM and `best.pt` |
+| `sameset` | source = `degrade(image_j)`, `j ≠ i`, target = `image_i` | you want the model unable to invert your degradation |
+| `unpaired` | two separate pools | you already have a matching source domain |
+
+**The trade-off in one sentence:** `paired` can learn to invert your specific
+degradation instead of learning the look, and `sameset` cannot — but `sameset`
+gives you no real quality number and no `best.pt`.
+
+**With two GPUs, run both.** Copy the notebook, set `TRAIN_MODE = "sameset"` and
+`name="b"` in the second, and compare the validation strips. That is the
+comparison worth making and it costs one session.
+
+**How to spot the failure:** if the model looks great on freshly-degraded images
+but poor on ordinary photographs, it learned the inverse rather than the
+aesthetic. The validation strip makes it obvious within a few epochs.
+
+### Validation strips
+
+After every epoch:
+
+```
+runs/<name>/validations/
+  epoch-0007.png   input | output | target, one image per row
+  latest.png
+  history.csv      epoch,images,psnr,ssim,l1,effect
+```
+
+`checkpoints/best.pt` holds the highest-PSNR weights seen, and `--keep-last`
+prunes old checkpoints. **Export `best.pt`, not `latest.pt`**, unless PSNR is
+still rising at the final epoch — that is the whole reason `best.pt` exists.
+
+Seeds are derived from each filename with SHA-256, so a strip rendered this
+session matches one rendered last week and epoch 7 is comparable to epoch 8.
 
 ### `--epochs` vs `extra_epochs`
 
@@ -377,25 +451,42 @@ second experiment, which is also the only way to get a real comparison.
 
 ### The comparison you actually want
 
-`edgehat` + `freqsplit` is the default. `swinir` + `freqsplit` is the closest
-architectural control. Two arms on two GPUs gives you a real answer in one
-session instead of two.
+At 4M parameters a single T4 is not saturated, so the second GPU is best spent
+answering a question rather than going faster. There are two worth asking.
 
-Duplicate the notebook, change cell 2 only:
+**Question 1 — does the model learn the look, or the inverse of my degradation?**
+This one is specific to the paired/sameset modes and is the more important of
+the two. Duplicate the notebook and change cell 3 only:
+
+```python
+# notebook A
+TRAIN_MODE = "paired"
+s = Session(..., train_mode=TRAIN_MODE, name="a", device="cuda")
+s.train(extra_epochs=20)
+
+# notebook B
+TRAIN_MODE = "sameset"
+s = Session(..., train_mode=TRAIN_MODE, name="b", device="cuda")
+s.train(extra_epochs=20)
+```
+
+Then put `runs/*/validations/epoch-0020.png` side by side. If the `paired` arm
+looks good on degraded inputs while the `sameset` arm looks better on ordinary
+photographs, that is the shortcut showing itself.
+
+**Question 2 — which architecture?**
 
 ```python
 # notebook A
 s = Session(..., arch="edgehat", head="freqsplit", name="a", device="cuda")
-s.train(extra_epochs=20)
 
 # notebook B
 s = Session(..., arch="swinir",  head="freqsplit", name="b", device="cuda")
-s.train(extra_epochs=20)
 ```
 
 Because `name` differs, the two runs live in separate directories and neither
-can clobber the other. Compare them on the same held-out images with
-`--tile` held constant, so the only variable is the architecture.
+can clobber the other. Compare them on the same held-out images with the
+inference settings held constant, so the only variable is the architecture.
 
 To pin a specific GPU inside one notebook:
 
@@ -510,20 +601,41 @@ part worth remembering.
 
 ```bash
 # Start a run, read the briefing first (recommended for any new experiment)
-nf train --source-dir SRC --target-dir TGT --name a --epochs 60
+nf train --target-dir POOL --name a --epochs 60
 
 # Non-interactive (scripts, re-runs)
-nf train --source-dir SRC --target-dir TGT --name a --epochs 60 --yes
+nf train --target-dir POOL --name a --epochs 60 --yes
 
 # Add epochs to an existing run
-nf train --source-dir SRC --target-dir TGT --name a --extra-epochs 20
+nf train --target-dir POOL --name a --extra-epochs 20
+
+# The shortcut-free variant, for your second GPU
+nf train --target-dir POOL --name b --epochs 60 --train-mode sameset
+
+# Train across two separate pools instead (the pre-degradation behaviour)
+nf train --source-dir SRC --target-dir TGT --name c --epochs 60
 
 # Kaggle: publish a snapshot every epoch so a disconnect costs one epoch
-nf train --source-dir SRC --target-dir TGT --name a --epochs 60 --snapshot-every 1
+nf train --target-dir POOL --name a --epochs 60 --snapshot-every 1
 
 # Snapshot less often to dodge API rate limits
 nf train ... --snapshot-every 5
 ```
+
+| Why | Command |
+|---|---|
+| Wider or gentler corruption | `--degrade-profile strong` / `subtle` |
+| Override one degradation bound | `--degrade-contrast-min 0.3 --degrade-contrast-max 0.4` |
+| A reusable or "virtual camera" profile | `--degrade-config my-camera.json` |
+| Turn the ramp off | `--no-degrade-curriculum` |
+| Feed clean targets as sources more often | `--degrade-none-prob 0.2` |
+| Suppress the supervised term | `--paired-weight 0` |
+| Fewer / smaller validation strips | `--val-count 4`, `--val-cols 2` |
+| Sample a fresh validation set each epoch | `--val-select random` |
+| Supply your own held-out folder | `--val-holdout-dir /kaggle/input/.../val_night` |
+| Keep more or fewer checkpoints | `--keep-last 5` |
+| Don't keep a best checkpoint | `--no-keep-best` |
+| Reduce frame-to-frame flicker | `--ema-decay 0.999` |
 
 | Why | Command |
 |---|---|

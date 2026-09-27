@@ -627,6 +627,30 @@ def test_ema_resumes(tmp_path) -> None:
     assert s.state().last_epoch == 1
 
 
+def test_evaluate_batch_rejects_a_device_mismatch() -> None:
+    """The raw loader batch is CPU; scoring it against a device output must fail.
+
+    A regression guard, not a feature: scoring once mixed a CPU ``target`` with
+    an MPS ``deterministic`` and only surfaced on a non-CPU machine, which the
+    CPU-only test suite could not see.
+    """
+
+    cpu = torch.rand(2, 3, 16, 16)
+    other = "mps" if torch.backends.mps.is_available() else (
+        "cuda" if torch.cuda.is_available() else None
+    )
+    if other is None:
+        pytest.skip("no non-CPU device available to exercise the mismatch")
+    device_batch = {"target": cpu.to(other), "degrade_params": torch.rand(2, 8).to(other)}
+    on_device = cpu.to(other)
+    with pytest.raises(RuntimeError, match="same device"):
+        evaluate_batch({"target": cpu, "degrade_params": torch.rand(2, 8)},
+                       on_device, on_device)
+    # the device-resident form is what Session passes
+    ok = evaluate_batch(device_batch, on_device, on_device)
+    assert ok.images == 2
+
+
 def test_curriculum_reaches_the_dataset(tmp_path) -> None:
     """Session must hand its epoch horizon to the degradation config."""
 

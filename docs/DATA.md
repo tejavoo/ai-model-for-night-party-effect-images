@@ -110,6 +110,51 @@ unlimited, correctly-labelled, correctly-licenced targets by construction, and i
 converges much faster than scraping. See
 [`DATASET_SOURCING.md`](DATASET_SOURCING.md#what-will-work).
 
+---
+
+## What a valid dataset looks like per training mode
+
+The three modes need different things, and it is worth being explicit because the
+requirement changes shape completely.
+
+| mode | directories you need | correspondence needed? |
+|---|---|---|
+| `unpaired` | a source pool **and** a target pool | no |
+| `paired` | a target pool only | yes, manufactured by degradation |
+| `sameset` | a target pool only | no, by construction |
+
+For `paired` and `sameset` the source directory is **not used**. Passing a
+different `--source-dir` alongside those modes is a hard error rather than a
+silent fallback, because the path you expected to be read would not be.
+
+### The pool has to be big enough to split
+
+`paired` and `sameset` carve a validation split out of the target pool
+(`--val-split`, default 15%). Consequences:
+
+- a pool of one image cannot use `sameset` at all — there is no second image to
+  draw a different source from, so it falls back to `paired` with a printed
+  warning;
+- a small pool can end up with a validation half of one or two images, which makes
+  the PSNR number noisy. It is still worth having: a noisy signal beats none, and
+  `--val-holdout-dir` lets you supply a proper held-out set instead.
+
+### Held-out images must be held out by scene
+
+The split is deterministic and seeded, so it is the same every session and a
+strip rendered this week matches one rendered last week. But a split is only
+honest if near-duplicate frames of the same scene do not straddle it. If your
+pool contains bursts from one shoot, split by burst rather than by file.
+
+### What the degradation does *not* fix
+
+The manufactured source is a simulation. It removes grain, flattens the tonal
+range, warms the white balance and raises saturation — but it cannot re-render
+the lighting, so any real halation in the target is attenuated rather than
+removed, and the model will be asked to re-create something the source never
+fully lost. Expect this to matter most on images with strong specular
+highlights. See [`TRAINING.md`](TRAINING.md#two-limitations-worth-knowing).
+
 ## No paired images
 
 The training code does not require:

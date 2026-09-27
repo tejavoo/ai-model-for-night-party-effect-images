@@ -37,8 +37,24 @@ training_photos/
 
 **2. Open a notebook** and set **Accelerator → GPU T4 x2**.
 
-**3. Put the repo in place.** Either clone it in an early cell, or upload the
-repo as a Dataset and unzip it into `/kaggle/working/nightflash-edge`.
+**3. Put the repo in place.** Either clone it in an early cell, upload the
+repo as a Dataset and unzip it into `/kaggle/working/nightflash-edge`, or
+upload the pre-built bundle:
+
+```bash
+# On your Mac:
+./scripts/make_kaggle_bundle.sh    # → dist/nightflash-edge-kaggle.zip
+```
+
+Then upload `nightflash-edge-kaggle.zip` as a Kaggle Dataset, attach it in
+the **Add Data** panel, and unzip it in the notebook:
+
+```python
+!unzip -q /kaggle/input/<your-bundle-dataset>/nightflash-edge-kaggle.zip \
+    -d /kaggle/working/nightflash-edge
+```
+
+Or clone directly:
 
 ```python
 !git clone --depth 1 https://github.com/you/nightflash-edge /kaggle/working/nightflash-edge
