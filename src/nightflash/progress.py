@@ -202,13 +202,16 @@ class PlainReporter(ProgressReporter):
         averaged = self._reset()
         percent = 100.0 * step_in_epoch / max(self._total, 1)
         eta = self._eta(step_in_epoch) if self.show_eta else ""
-        print(
+        line = (
             f"  [{percent:5.1f}%] epoch {self._epoch}/{self._epochs} "
             f"step {step_in_epoch}/{self._total}{eta}  "
-            f"{format_metrics(averaged, DISPLAY_KEYS)}",
-            file=self.stream,
-            flush=True,
+            f"{format_metrics(averaged, DISPLAY_KEYS)}"
         )
+        if in_notebook():
+            sys.stdout.write("\r" + line + " " * 20)
+            sys.stdout.flush()
+        else:
+            print(line, file=self.stream, flush=True)
 
     def finish_epoch(self, epoch: int, epochs: int, elapsed: float, metrics: dict[str, float]) -> None:
         averaged = self._reset() if self._count else metrics

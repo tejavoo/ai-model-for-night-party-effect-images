@@ -42,15 +42,15 @@ MyDrive/nightflash-edge/
 
 | Domain | Count | Status |
 |---|---:|---|
-| `normal_photos` (source) | 1000 | fine |
-| `disposable_photos` (target) | 935 | **wrong domain, not just small — see below** |
+| `normal_photos` (source) | 1001 | fine |
+| `disposable_photos` (target) | 932 | **wrong domain, not just small — see below** |
 | `validation_photos` (source) | 20 | fine |
 | held-out target | 0 | **target quality is unmeasurable** |
 
 This is enough to prove the pipeline runs end to end. It is not enough to judge
 model quality.
 
-The target folder has 935 images but they are not night-flash photographs.
+The target folder has 932 images but they are not night-flash photographs.
 Measured mean luminance is 0.350 (genuine night flash is below 0.20); only 9.3%
 of the folder is in the target range and 45.2% is daylit above 0.35. There is
 also no `manifest.csv`, so licensing is unrecorded.
@@ -102,7 +102,7 @@ REPO_BRANCH = "main"
 To push from your Mac (this repo currently has no remote):
 
 ```bash
-cd /Users/tejavu/Documents/opencode-experiments/disposable-cam-model-train
+cd <repo-path>
 git remote add origin https://github.com/you/nightflash-edge.git
 git add -A
 git commit -m "Add Colab notebook, dataset sourcing, and training scaffold"
@@ -484,7 +484,7 @@ colab drivemount -s nightflash
 # 4. Upload the code bundle
 colab upload -s nightflash dist/nightflash-edge-colab.zip /content/nightflash-edge-colab.zip
 
-# 5. Upload the dataset (once; ~1000 + 45 + 20 images)
+# 5. Upload the dataset (once; ~1001 + 932 + 21 images)
 colab upload -s nightflash training_photos /content/training_photos
 
 # 6. Train. colab exec -c takes Python, so we shell out to the job script.

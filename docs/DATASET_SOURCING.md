@@ -136,8 +136,8 @@ one, so no scraped target set is shipped.
 
 ### Current state of `disposable_photos/`
 
-935 images are present now, with **no `manifest.csv`**, so their provenance and
-licensing are unrecorded. Measured over all 935:
+932 images are present now, with **no `manifest.csv`**, so their provenance and
+licensing are unrecorded. Measured over all 932:
 
 | mean luminance | images | share | reads as |
 |---|---:|---:|---|

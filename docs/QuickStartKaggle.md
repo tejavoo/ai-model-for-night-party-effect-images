@@ -34,8 +34,8 @@ from nightflash import Session, brief
 TRAIN_MODE = "paired"           # "paired" | "sameset" | "unpaired"
 s = Session(
     train_mode=TRAIN_MODE,
-    source_dir="/kaggle/input/nightflash-data/normal_photos" if TRAIN_MODE == "unpaired" else None,
-    target_dir="/kaggle/input/nightflash-data/disposable_photos",
+    source_dir="/kaggle/input/datasets/levelupai/night-flash-images/training_photos/normal_photos" if TRAIN_MODE == "unpaired" else None,
+    target_dir="/kaggle/input/datasets/levelupai/night-flash-images/training_photos/disposable_photos",
     runs_root="/kaggle/working/runs",
     arch="edgehat", head="freqsplit",
     image_size=256, batch_size=8, epochs=60,
@@ -51,7 +51,7 @@ print(brief(s, mode="train"))   # read this before training
 s.train(extra_epochs=20)
 
 # cell 4  look at the output
-s.infer("/kaggle/input/nightflash-data/normal_photos", seeds=2, save_comparison=True)
+s.infer("/kaggle/input/datasets/levelupai/night-flash-images/training_photos/normal_photos", seeds=2, save_comparison=True)
 # runs/<name>/validations/epoch-0020.png   input | output | target
 # runs/<name>/validations/history.csv      psnr / ssim / l1 per epoch
 
@@ -87,7 +87,7 @@ from pathlib import Path
 from PIL import Image
 
 lums, sizes = [], []
-for p in sorted(Path("/kaggle/input/nightflash-data/disposable_photos").glob("*")):
+for p in sorted(Path("/kaggle/input/datasets/levelupai/night-flash-images/training_photos/disposable_photos").glob("*")):
     if p.suffix.lower() not in (".jpg", ".jpeg", ".png", ".heic", ".webp"):
         continue
     im = Image.open(p).convert("L")
@@ -119,7 +119,7 @@ Create a Kaggle Dataset from your photo folders. Keep the two domains in
 separate subfolders:
 
 ```
-nightflash-data/
+night-flash-images/training_photos/
   normal_photos/        # the source domain: ordinary daylight photos
   disposable_photos/    # the target domain: real night-flash photos
 ```
@@ -128,26 +128,11 @@ Attach it in the notebook's **Add Data** panel, right-hand side, as *Input*.
 
 ### 2. Get the code in
 
-Either attach the bundle as a second dataset, or paste the install cell:
-
-```bash
-# On your Mac, build the bundle:
-./scripts/make_kaggle_bundle.sh    # → dist/nightflash-edge-kaggle.zip
-```
-
-Upload `nightflash-edge-kaggle.zip` as a Kaggle Dataset, attach it in the
-**Add Data** panel, then unzip it in the notebook:
+Upload `nightflash-edge-kaggle.zip` as a Kaggle Dataset. Kaggle auto-extracts
+it into `/kaggle/input/`. Attach it in the **Add Data** panel, then install:
 
 ```python
-!unzip -q /kaggle/input/<your-bundle-dataset>/nightflash-edge-kaggle.zip \
-    -d /kaggle/working/nightflash-edge
-```
-
-Or install directly from the uploaded repo:
-
-```python
-!pip install -q pyyaml pillow numpy torch torchvision kaggle
-!pip install -q -e .          # if you uploaded the repo
+!pip install -q -e /kaggle/input/datasets/levelupai/nightflash-edge-kaggle
 ```
 
 ### 3. Pick the GPU
@@ -194,8 +179,8 @@ TRAIN_MODE = "paired"     # "paired" | "sameset" | "unpaired"
 
 s = Session(
     train_mode=TRAIN_MODE,
-    source_dir="/kaggle/input/nightflash-data/normal_photos" if TRAIN_MODE == "unpaired" else None,
-    target_dir="/kaggle/input/nightflash-data/disposable_photos",
+    source_dir="/kaggle/input/datasets/levelupai/night-flash-images/training_photos/normal_photos" if TRAIN_MODE == "unpaired" else None,
+    target_dir="/kaggle/input/datasets/levelupai/night-flash-images/training_photos/disposable_photos",
     runs_root="/kaggle/working/runs",
     arch="edgehat",
     head="freqsplit",
@@ -527,7 +512,7 @@ Then confirm it against PyTorch before you trust it:
 python -m nightflash.validate_coreml \
     --checkpoint runs/edgehat_freqsplit_night/checkpoints/latest.pt \
     --coreml model.mlpackage \
-    --input /kaggle/input/nightflash-data/normal_photos \
+    --input /kaggle/input/datasets/levelupai/night-flash-images/training_photos/normal_photos \
     --image-size 256
 ```
 
@@ -712,14 +697,14 @@ overwrites your weights with epoch 1.
 
 You need a **held-out target set** — night-flash photos the model never trained
 on — or you have no way to tell whether the model learned the look. Keep it out
-of `target_dir`. `/kaggle/input/nightflash-data/val_night` is a good place.
+of `target_dir`. `/kaggle/input/datasets/levelupai/night-flash-images/training_photos/val_night` is a good place.
 
 ```bash
 # Score a checkpoint against the held-out set
 python -m nightflash.evaluate \
     --checkpoint runs/edgehat_freqsplit_night/checkpoints/latest.pt \
-    --source-dir /kaggle/input/nightflash-data/normal_photos \
-    --target-dir /kaggle/input/nightflash-data/val_night \
+    --source-dir /kaggle/input/datasets/levelupai/night-flash-images/training_photos/normal_photos \
+    --target-dir /kaggle/input/datasets/levelupai/night-flash-images/training_photos/val_night \
     --output-json runs/edgehat_freqsplit_night/evaluations/score.json
 ```
 

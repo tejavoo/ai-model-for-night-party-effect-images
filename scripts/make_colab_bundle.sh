@@ -34,6 +34,7 @@ zip -q -r "$ZIP_PATH" . \
   -x 'venv/*' \
   -x 'dist/*' \
   -x 'training_photos/*' \
+  -x 'training_photos.zip' \
   -x 'data/*' \
   -x 'datasets/*' \
   -x 'runs/*' \

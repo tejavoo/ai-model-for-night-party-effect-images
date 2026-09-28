@@ -34,6 +34,7 @@ zip -q -r "$ZIP_PATH" . \
   -x 'venv/*' \
   -x 'dist/*' \
   -x 'training_photos/*' \
+  -x 'training_photos.zip' \
   -x 'data/*' \
   -x 'datasets/*' \
   -x 'runs/*' \
@@ -64,6 +65,6 @@ echo "  src/                               -> all source code"
 echo "  scripts/                           -> utility scripts"
 echo
 echo "Next:"
-echo "  Kaggle : upload this zip as a Dataset, attach it in the Add Data panel,"
-echo "           unzip into /kaggle/working/nightflash-edge, then open"
-echo "           notebook/nightflash_kaggle.ipynb"
+echo "  Kaggle : upload this zip as a Dataset, attach it in the Add Data panel."
+echo "           Kaggle auto-extracts it into /kaggle/input/. No unzip needed."
+echo "           Then open notebook/nightflash_kaggle.ipynb"

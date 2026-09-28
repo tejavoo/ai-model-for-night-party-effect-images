@@ -2,13 +2,7 @@
 
 A small, open-source training and deployment toolkit for learning a **disposable-camera / Night Flash look from unpaired image domains**.
 
-The project is designed around the existing native app:
-
-```text
-/Users/tejavu/Documents/opencode-experiments/disposable-cam
-```
-
-The app already has a deterministic Core ML color transform plus Core Image/Vision finishing. This repository adds a separate, compact learned model that can learn a more adaptive style without requiring paired source/target images.
+The project is designed around the existing native app (a separate iOS repository). The app already has a deterministic Core ML color transform plus Core Image/Vision finishing. This repository adds a separate, compact learned model that can learn a more adaptive style without requiring paired source/target images.
 
 ## What this repository contains
 
@@ -70,7 +64,7 @@ existing Vision person mask and Core Image effects in the app.
 ## Quick start
 
 ```bash
-cd /Users/tejavu/Documents/opencode-experiments/disposable-cam-model-train
+cd <repo-path>
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -U pip
@@ -452,14 +446,14 @@ a `manifest.csv`.
 
 | Folder | Images | `manifest.csv` | Status |
 | --- | ---: | --- | --- |
-| `normal_photos/` | 1000 | yes | Built — source domain |
+| `normal_photos/` | 1001 | yes | Built — source domain |
 | `validation_photos/` | 20 | yes | Built — held-out source images |
-| `disposable_photos/` | 935 | **no** | **Not a usable target domain — see below** |
+| `disposable_photos/` | 932 | **no** | **Not a usable target domain — see below** |
 
 ### ⚠️ The target domain is the blocker, not the model
 
 `disposable_photos/` is the only folder the model learns a look *from*, and it is
-not currently that look. Measured over all 935 images:
+not currently that look. Measured over all 932 images:
 
 | mean luminance | images | share | reads as |
 |---|---:|---:|---|
@@ -472,8 +466,8 @@ not currently that look. Measured over all 935 images:
 Mean luminance is **0.350**, median **0.334**. Genuine night flash sits below
 0.20. So:
 
-- only **9.3%** (87 of 935) of the folder is in the target range;
-- **45.2%** (423 of 935) is above 0.35, i.e. daylit;
+- only **9.3%** (87 of 932) of the folder is in the target range;
+- **45.2%** (423 of 932) is above 0.35, i.e. daylit;
 - filenames are daylight travel and outdoor stock —
   `young-woman-exploring-the-grand-palace-in-bangkok.jpg`,
   `scenic-desert-road-along-colorado-river.jpg`;
@@ -485,7 +479,7 @@ look — and no amount of epochs, architecture, or tiling will fix that.
 
 Two further gaps:
 
-- **No `manifest.csv`**, so licensing and attribution for those 935 images are
+- **No `manifest.csv`**, so licensing and attribution for those 932 images are
   unrecorded. Resolve before anything ships.
 - **No held-out target set.** Without one, target-domain quality is
   unmeasurable and you cannot tell progress from memorisation.

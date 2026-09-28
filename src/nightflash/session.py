@@ -714,6 +714,15 @@ class Session:
                                           optimizer_d, epoch, global_step, val_metrics)
                     append_history(self.validation_dir / "history.csv",
                                    val_metrics.as_row(epoch + 1))
+                    # Display validation strip inline (notebooks only)
+                    try:
+                        from IPython.display import display, Image, clear_output
+                        clear_output(wait=True)
+                        strip_path = self.validation_dir / "latest.png"
+                        if strip_path.exists():
+                            display(Image(filename=str(strip_path), width=640))
+                    except ImportError:
+                        pass
 
             if self.snapshot_every > 0 and (epoch + 1) % self.snapshot_every == 0:
                 self._maybe_snapshot(epoch + 1)

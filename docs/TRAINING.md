@@ -3,7 +3,7 @@
 ## Install
 
 ```bash
-cd /Users/tejavu/Documents/opencode-experiments/disposable-cam-model-train
+cd <repo-path>
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -U pip

@@ -5,7 +5,7 @@
 Run this on macOS:
 
 ```bash
-cd /Users/tejavu/Documents/opencode-experiments/disposable-cam-model-train
+cd <repo-path>
 python3 -m pip install -e '.[coreml]'
 ```
 
@@ -239,8 +239,8 @@ AVCapture frame
 The current project files to adapt are:
 
 ```text
-/Users/tejavu/Documents/opencode-experiments/disposable-cam/Services/NightFlashModel.swift
-/Users/tejavu/Documents/opencode-experiments/disposable-cam/Services/NightFlashProcessor.swift
+<app-path>/Services/NightFlashModel.swift
+<app-path>/Services/NightFlashProcessor.swift
 ```
 
 The current `NightFlashModel.swift` adapter expects a 512×512 image-buffer model. The new exporter uses a fixed 512×512 image input by default. You can either:
